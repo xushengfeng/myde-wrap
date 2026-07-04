@@ -3,60 +3,180 @@ use std::time::Instant;
 use tracing::{info, error};
 
 use smithay::{
-    backend::renderer::{
-        element::{
-            surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-            Kind,
-        },
-        gles::GlesRenderer,
-        utils::{draw_render_elements, on_commit_buffer_handler},
-        Color32F, Frame, Renderer,
-    },
-    delegate_compositor, delegate_seat, delegate_shm, delegate_xdg_shell,
+    desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatHandler, SeatState},
-    reexports::wayland_server::Display,
-    utils::{Rectangle, Serial, Transform},
+    reexports::{
+        calloop::{EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic},
+        wayland_server::{
+            Display, DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::wl_surface::WlSurface,
+        },
+    },
+    utils::{Logical, Point},
     wayland::{
-        buffer::BufferHandler,
-        compositor::{
-            with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, TraversalAction,
-        },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-        },
-        shm::{ShmHandler, ShmState},
+        compositor::{CompositorClientState, CompositorState},
+        output::OutputManagerState,
+        selection::data_device::DataDeviceState,
+        shell::xdg::XdgShellState,
+        shm::ShmState,
+        socket::ListeningSocketSource,
     },
 };
-use wayland_server::{
-    backend::{ClientData, ClientId, DisconnectReason},
-    protocol::{
-        wl_buffer,
-        wl_surface::{self, WlSurface},
-    },
-    Client, ListeningSocket,
-};
-use wayland_protocols::xdg::shell::server::xdg_toplevel;
-
-use drm::control::{connector, crtc, Device, Mode};
-use drm::buffer::Buffer;
-use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsFd;
 
 use crate::protocol::{Rect, Transform as MyTransform, ScreenInfo};
 use crate::renderer::Renderer as MyRenderer;
 
-struct App {
-    compositor_state: CompositorState,
-    xdg_shell_state: XdgShellState,
-    shm_state: ShmState,
-    seat_state: SeatState<Self>,
-    seat: Seat<Self>,
-    start_time: Instant,
+pub struct App {
+    pub start_time: std::time::Instant,
+    pub socket_name: std::ffi::OsString,
+    pub display_handle: DisplayHandle,
+    pub space: Space<Window>,
+    pub loop_signal: LoopSignal,
+    
+    // Smithay State
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub shm_state: ShmState,
+    pub output_manager_state: OutputManagerState,
+    pub seat_state: SeatState<App>,
+    pub data_device_state: DataDeviceState,
+    pub popups: PopupManager,
+    pub seat: Seat<Self>,
 }
 
-struct ClientState {
-    compositor_state: CompositorClientState,
+impl App {
+    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
+        let start_time = std::time::Instant::now();
+        let dh = display.handle();
+
+        // Here we initialize implementations of some wayland protocols
+        // Some of them require us to implement traits on the App state,
+        // you can find those implementations in the `crate::handlers` module
+
+        // Initialize protocols needed for displaying windows
+        let compositor_state = CompositorState::new::<Self>(&dh);
+        let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let popups = PopupManager::default();
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+
+        // Data device is responsible for clipboard and drag-and-drop
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+
+        // A seat is a group of keyboards, pointer and touch devices.
+        // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
+        let mut seat_state = SeatState::new();
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "myde-wrap");
+
+        // Notify clients that we have a keyboard, for the sake of the example we assume that keyboard is always present.
+        // You may want to track keyboard hot-plug in real compositor.
+        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+
+        // Notify clients that we have a pointer (mouse)
+        // Here we assume that there is always pointer plugged in
+        seat.add_pointer();
+
+        // A space represents a two-dimensional plane. Windows and Outputs can be mapped onto it.
+        //
+        // Windows get a position and stacking order through mapping.
+        // Outputs become views of a part of the Space and can be rendered via Space::render_output.
+        let space = Space::default();
+
+        // Setup a wayland socket that will be used to accept clients
+        let socket_name = Self::init_wayland_listener(display, event_loop);
+
+        // Get the loop signal, used to stop the event loop
+        let loop_signal = event_loop.get_signal();
+
+        Self {
+            start_time,
+            display_handle: dh,
+            space,
+            loop_signal,
+            socket_name,
+            compositor_state,
+            xdg_shell_state,
+            shm_state,
+            output_manager_state,
+            seat_state,
+            data_device_state,
+            popups,
+            seat,
+        }
+    }
+
+    fn init_wayland_listener(display: Display<App>, event_loop: &mut EventLoop<Self>) -> std::ffi::OsString {
+        // Creates a new listening socket, automatically choosing the next available `wayland` socket name.
+        let listening_socket = ListeningSocketSource::new_auto().unwrap();
+
+        // Get the name of the listening socket.
+        // Clients will connect to this socket.
+        let socket_name = listening_socket.socket_name().to_os_string();
+
+        let loop_handle = event_loop.handle();
+        loop_handle
+            .insert_source(listening_socket, move |client_stream, _, state| {
+                // Inside the callback, you should insert the client into the display.
+                //
+                // You may also associate some data with the client when inserting the client.
+                state
+                    .display_handle
+                    .insert_client(client_stream, Arc::new(ClientState::default()))
+                    .unwrap();
+            })
+            .expect("Failed to init the wayland event source.");
+
+        // You also need to add the display itself to the event loop, so that client events will be processed by wayland-server.
+        loop_handle
+            .insert_source(
+                Generic::new(display, Interest::READ, CalloopMode::Level),
+                |_, display, state| {
+                    // Safety: we don't drop the display
+                    unsafe {
+                        display.get_mut().dispatch_clients(state).unwrap();
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .unwrap();
+
+        socket_name
+    }
+
+    pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.space.element_under(pos).and_then(|(window, location)| {
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, (p + location).to_f64()))
+        })
+    }
+
+    pub fn process_input_event(&mut self, event: smithay::backend::input::InputEvent<smithay::backend::winit::WinitInput>) {
+        // Handle input events
+        match event {
+            smithay::backend::input::InputEvent::Keyboard { event } => {
+                // Handle keyboard events
+                let _ = event;
+            }
+            smithay::backend::input::InputEvent::PointerMotion { event } => {
+                // Handle pointer motion
+                let _ = event;
+            }
+            smithay::backend::input::InputEvent::PointerButton { event } => {
+                // Handle pointer button
+                let _ = event;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Data associated with a wayland client that connects to myde-wrap.
+/// One instance of this type per client.
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
 }
 
 impl ClientData for ClientState {
@@ -64,336 +184,5 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-impl BufferHandler for App {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-impl XdgShellHandler for App {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell_state
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        info!("新窗口创建");
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
-        });
-        surface.send_configure();
-    }
-
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
-    fn grab(&mut self, _surface: PopupSurface, _seat: wayland_server::protocol::wl_seat::WlSeat, _serial: Serial) {}
-    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {}
-}
-
-impl CompositorHandler for App {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
-    }
-
-    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
-    }
-
-    fn commit(&mut self, surface: &WlSurface) {
-        on_commit_buffer_handler::<Self>(surface);
-    }
-}
-
-impl ShmHandler for App {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm_state
-    }
-}
-
-impl SeatHandler for App {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
-    }
-
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
-}
-
-delegate_compositor!(App);
-delegate_shm!(App);
-delegate_seat!(App);
-delegate_xdg_shell!(App);
-
-struct DrmDevice {
-    file: File,
-}
-
-impl AsFd for DrmDevice {
-    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
-        self.file.as_fd()
-    }
-}
-
-impl drm::Device for DrmDevice {}
-impl Device for DrmDevice {}
-
-struct DrmOutput {
-    file: File,
-    crtc: crtc::Handle,
-    connector: connector::Handle,
-    mode: Mode,
-    width: u32,
-    height: u32,
-}
-
-pub struct WaylandCompositor {
-    width: u32,
-    height: u32,
-    display: Option<Display<App>>,
-    state: Option<App>,
-    listener: Option<ListeningSocket>,
-    outputs: Vec<DrmOutput>,
-}
-
-impl WaylandCompositor {
-    pub fn new() -> Self {
-        info!("Wayland compositor 已创建");
-        Self {
-            width: 1920,
-            height: 1080,
-            display: None,
-            state: None,
-            listener: None,
-            outputs: Vec::new(),
-        }
-    }
-
-    pub fn init_winit(&mut self) -> anyhow::Result<()> {
-        info!("初始化 Wayland compositor");
-
-        // 创建 Wayland display
-        let display: Display<App> = Display::new()?;
-        let dh = display.handle();
-
-        // 创建 compositor 状态
-        let compositor_state = CompositorState::new::<App>(&dh);
-        let shm_state = ShmState::new::<App>(&dh, vec![]);
-        let mut seat_state = SeatState::new();
-        let seat = seat_state.new_wl_seat(&dh, "myde-wrap");
-
-        let state = App {
-            compositor_state,
-            xdg_shell_state: XdgShellState::new::<App>(&dh),
-            shm_state,
-            seat_state,
-            seat,
-            start_time: Instant::now(),
-        };
-
-        // 创建 socket
-        let socket_name = format!("myde-wrap-{}", std::process::id());
-        let listener = ListeningSocket::bind(socket_name.clone())?;
-        info!("Wayland socket 创建成功: {}", socket_name);
-
-        // 设置环境变量
-        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-
-        self.display = Some(display);
-        self.state = Some(state);
-        self.listener = Some(listener);
-
-        // 初始化 DRM
-        self.init_drm()?;
-
-        Ok(())
-    }
-
-    fn init_drm(&mut self) -> anyhow::Result<()> {
-        info!("初始化 DRM 显示后端");
-
-        let drm_paths = ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/renderD128"];
-
-        for path in &drm_paths {
-            match OpenOptions::new().read(true).write(true).open(path) {
-                Ok(file) => {
-                    info!("成功打开 DRM 设备: {}", path);
-                    let device = DrmDevice { file: file.try_clone()? };
-
-                    let res = device.resource_handles()?;
-
-                    // 查找所有可用的连接器
-                    for &conn in res.connectors() {
-                        let info = device.get_connector(conn, false)?;
-                        if info.state() == connector::State::Connected && !info.modes().is_empty() {
-                            let mode = info.modes()[0];
-                            info!("找到连接器: {:?}, 模式: {:?}", conn, mode);
-
-                            for &enc in info.encoders() {
-                                let enc_info = device.get_encoder(enc)?;
-                                let filter = enc_info.possible_crtcs();
-
-                                for c in res.filter_crtcs(filter) {
-                                    let output = DrmOutput {
-                                        file: file.try_clone()?,
-                                        crtc: c,
-                                        connector: conn,
-                                        mode,
-                                        width: mode.size().0 as u32,
-                                        height: mode.size().1 as u32,
-                                    };
-                                    self.outputs.push(output);
-                                    info!("添加输出: CRTC {:?}, 连接器 {:?}", c, conn);
-                                    break;
-                                }
-                                if !self.outputs.is_empty() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if !self.outputs.is_empty() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    info!("无法打开 {}: {}", path, e);
-                }
-            }
-        }
-
-        if self.outputs.is_empty() {
-            return Err(anyhow::anyhow!("未找到可用的输出"));
-        }
-
-        // 使用第一个输出作为默认尺寸
-        if let Some(output) = self.outputs.first() {
-            self.width = output.width;
-            self.height = output.height;
-        }
-
-        Ok(())
-    }
-
-    pub fn set_size(&mut self, width: u32, height: u32) {
-        self.width = width;
-        self.height = height;
-        info!("设置渲染尺寸: {}x{}", width, height);
-    }
-
-    pub fn dispatch(&mut self) {
-        // 处理新客户端连接
-        if let (Some(ref listener), Some(ref display)) = (&self.listener, &self.display) {
-            if let Ok(Some(stream)) = listener.accept() {
-                let mut display_handle = display.handle();
-                let client_state = ClientState {
-                    compositor_state: CompositorClientState::default(),
-                };
-                if let Err(e) = display_handle.insert_client(stream, Arc::new(client_state)) {
-                    error!("客户端连接失败: {}", e);
-                }
-            }
-        }
-
-        // 处理 Wayland 事件
-        if let (Some(ref mut display), Some(ref mut state)) = (&mut self.display, &mut self.state) {
-            display.dispatch_clients(state).unwrap_or_default();
-            display.flush_clients().unwrap_or_default();
-        }
-    }
-
-    pub fn render_rect_to_screen(&mut self, screen_index: usize, x: i32, y: i32, width: u32, height: u32, transform: &MyTransform) {
-        if screen_index >= self.outputs.len() {
-            error!("无效的屏幕索引: {}", screen_index);
-            return;
-        }
-
-        let output = &self.outputs[screen_index];
-        info!("渲染到屏幕 {}: ({}, {}) {}x{}", screen_index, x, y, width, height);
-
-        // 计算变换后的矩形
-        let (tx, ty, tw, th) = MyRenderer::compute_transformed_rect(
-            &Rect { x, y, width, height },
-            transform,
-        );
-
-        if let Err(e) = self.render_to_drm(output, tx, ty, tw, th) {
-            error!("DRM 渲染错误: {}", e);
-        }
-    }
-
-    fn render_to_drm(&self, output: &DrmOutput, x: i32, y: i32, width: u32, height: u32) -> anyhow::Result<()> {
-        let device = DrmDevice { file: output.file.try_clone()? };
-        let (w, h) = (output.width, output.height);
-        let bpp = 32u32;
-
-        let mut db = device.create_dumb_buffer(
-            (w, h),
-            drm::buffer::DrmFourcc::Argb8888,
-            bpp,
-        )?;
-
-        let stride = db.pitch() as usize;
-        let mut mapping = device.map_dumb_buffer(&mut db)?;
-
-        // 清除为黑色
-        for i in 0..mapping.len() {
-            mapping[i] = 0;
-        }
-
-        // 绘制白色矩形
-        let x = x.max(0) as u32;
-        let y = y.max(0) as u32;
-        let end_x = (x + width).min(w);
-        let end_y = (y + height).min(h);
-
-        for py in y..end_y {
-            for px in x..end_x {
-                let dst_idx = py as usize * stride + px as usize * 4;
-                if dst_idx + 4 <= mapping.len() {
-                    mapping[dst_idx] = 255;     // B
-                    mapping[dst_idx + 1] = 255; // G
-                    mapping[dst_idx + 2] = 255; // R
-                    mapping[dst_idx + 3] = 255; // A
-                }
-            }
-        }
-
-        drop(mapping);
-
-        let fb = device.add_framebuffer(&db, 32, 32)?;
-
-        device.set_crtc(
-            output.crtc,
-            Some(fb),
-            (0, 0),
-            &[output.connector],
-            Some(output.mode),
-        )?;
-
-        Ok(())
-    }
-
-    pub fn render_rect(&mut self, x: i32, y: i32, width: u32, height: u32) {
-        // 默认渲染到第一个屏幕
-        if let Some(output) = self.outputs.first() {
-            if let Err(e) = self.render_to_drm(output, x, y, width, height) {
-                error!("DRM 渲染错误: {}", e);
-            }
-        }
-    }
-
-    pub fn clear_buffer(&mut self) {}
-
-    pub fn get_width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn get_height(&self) -> u32 {
-        self.height
-    }
-
-    pub fn get_output_count(&self) -> usize {
-        self.outputs.len()
-    }
-}
+// Re-export for use in other modules
+pub use smithay::reexports::wayland_server::Display as WaylandDisplay;

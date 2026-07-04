@@ -3,19 +3,21 @@ mod socket;
 mod renderer;
 mod compositor;
 mod wayland;
+mod backend;
+mod winit;
+mod drm;
+mod handlers;
 
-use std::sync::Arc;
 use std::process::Command;
-use tokio::sync::Mutex;
 use tracing::{info, error};
-use tracing_subscriber::EnvFilter;
 use clap::Parser;
+use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 
 use crate::socket::SocketServer;
-use crate::renderer::Renderer;
-use crate::compositor::Compositor;
-use crate::wayland::WaylandCompositor;
-use crate::protocol::Transform;
+use crate::wayland::App;
+use crate::backend::RenderBackend;
+use crate::winit::WinitBackend;
+use crate::drm::DrmBackend;
 
 #[derive(Parser)]
 #[command(name = "myde-wrap")]
@@ -24,36 +26,58 @@ struct Args {
     /// 要渲染的程序命令
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
+
+    /// 渲染后端 (winit 或 drm)
+    #[arg(short, long, default_value = "winit")]
+    backend: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.command.is_empty() {
         eprintln!("错误: 请指定要渲染的程序");
-        eprintln!("用法: myde-wrap <command> [args...]");
+        eprintln!("用法: myde-wrap [--backend winit|drm] <command> [args...]");
         std::process::exit(1);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Initialize logging
+    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().init();
+    }
 
     let socket_path = std::env::temp_dir().join("myde-wrap.sock");
     let socket_server = SocketServer::new(socket_path.clone())?;
 
-    // 创建 Wayland compositor
-    let mut wayland_compositor = WaylandCompositor::new();
-    wayland_compositor.init_winit()?;
+    let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
+    let display: Display<App> = Display::new()?;
+    let mut state = App::new(&mut event_loop, display);
 
-    // 获取 Wayland socket 名称（由 wayland compositor 设置）
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
-    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    std::env::set_var("MYDE_WRAP_SOCKET", socket_path.to_str().unwrap());
+    // Create and initialize the selected backend
+    let mut backend: Box<dyn RenderBackend> = match args.backend.as_str() {
+        "drm" => {
+            info!("使用 DRM 后端");
+            Box::new(DrmBackend::new())
+        }
+        _ => {
+            info!("使用 winit 后端");
+            Box::new(WinitBackend::new())
+        }
+    };
+
+    backend.init(&mut event_loop, &mut state)?;
+    info!("后端初始化完成: {}", backend.name());
+
+    // Set WAYLAND_DISPLAY to our socket name, so child processes connect to myde-wrap
+    // rather than the host compositor
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+    unsafe { std::env::set_var("XDG_SESSION_TYPE", "wayland") };
+    unsafe { std::env::set_var("MYDE_WRAP_SOCKET", socket_path.to_str().unwrap()) };
 
     info!("MYDE_WRAP_SOCKET={:?}", socket_path);
-    info!("WAYLAND_DISPLAY={:?}", wayland_display);
+    info!("WAYLAND_DISPLAY={:?}", state.socket_name);
     info!("XDG_SESSION_TYPE=wayland");
 
     let program = &args.command[0];
@@ -73,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // 确保 Wayland 环境变量存在
     if !envs.iter().any(|(k, _)| k == "WAYLAND_DISPLAY") {
-        envs.push(("WAYLAND_DISPLAY".to_string(), wayland_display.to_string()));
+        envs.push(("WAYLAND_DISPLAY".to_string(), state.socket_name.to_str().unwrap().to_string()));
     }
     // 确保 XDG_SESSION_TYPE 环境变量存在
     if !envs.iter().any(|(k, _)| k == "XDG_SESSION_TYPE") {
@@ -87,22 +111,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("程序已启动, PID: {}", child.id());
 
-    let renderer = Arc::new(Mutex::new(Renderer::new()));
-    let compositor = Arc::new(Compositor::new(renderer.clone()));
-
-    // 获取默认屏幕尺寸并设置到 compositor
-    let screens = {
-        let r = renderer.lock().await;
-        r.get_screens()
-    };
-    if let Some(screen) = screens.first() {
-        wayland_compositor.set_size(screen.width, screen.height);
-    }
-
-    info!("启动 myde-wrap 合成器...");
-    info!("输出数量: {}", wayland_compositor.get_output_count());
-
-    tokio::spawn(async move {
+    // Spawn a task to handle child process exit
+    std::thread::spawn(move || {
         let status = child.wait();
         match status {
             Ok(status) => info!("程序退出, 状态: {}", status),
@@ -110,62 +120,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    loop {
-        // 处理 Wayland 事件
-        wayland_compositor.dispatch();
+    // Run the event loop
+    event_loop.run(None, &mut state, move |_| {
+        // myde-wrap is running
+    })?;
 
-        // 获取屏幕配置并渲染
-        let screen_configs = {
-            let r = renderer.lock().await;
-            r.get_screen_configs().to_vec()
-        };
-
-        for config in &screen_configs {
-            for (rect, transform) in config.rects.iter().zip(config.transforms.iter()) {
-                wayland_compositor.render_rect_to_screen(
-                    config.screen_index,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    transform,
-                );
-            }
-        }
-
-        // 如果没有屏幕配置，使用默认渲染
-        if screen_configs.is_empty() {
-            let rects = {
-                let r = renderer.lock().await;
-                r.get_captured_rects().to_vec()
-            };
-            for rect in &rects {
-                wayland_compositor.render_rect(rect.x, rect.y, rect.width, rect.height);
-            }
-        }
-
-        // 处理 Socket 连接
-        if let Some(mut stream) = socket_server.accept() {
-            let compositor = compositor.clone();
-            tokio::spawn(async move {
-                loop {
-                    match socket::read_message(&mut stream) {
-                        Ok(msg) => {
-                            info!("收到消息: {:?}", msg);
-                            let response = compositor.handle_message(msg).await;
-                            if let Err(e) = socket::write_message(&mut stream, &response) {
-                                error!("写入错误: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("读取错误: {}", e);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
+    Ok(())
 }

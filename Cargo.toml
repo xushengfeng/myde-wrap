@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-smithay = { version = "0.7", features = ["backend_drm", "backend_gbm", "backend_udev", "renderer_gl", "wayland_frontend"] }
+smithay = { version = "0.7", features = ["backend_winit", "backend_drm", "backend_gbm", "backend_udev", "renderer_gl", "wayland_frontend", "desktop"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
