@@ -8,6 +8,14 @@ pub struct Renderer {
     transforms: Vec<Transform>,
     screens: Vec<ScreenInfo>,
     input_enabled: bool,
+    screen_configs: Vec<ScreenConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScreenConfig {
+    pub screen_index: usize,
+    pub rects: Vec<Rect>,
+    pub transforms: Vec<Transform>,
 }
 
 impl Renderer {
@@ -40,6 +48,7 @@ impl Renderer {
             transforms,
             screens,
             input_enabled: true,
+            screen_configs: Vec::new(),
         }
     }
 
@@ -119,6 +128,21 @@ impl Renderer {
         if screen_index >= self.screens.len() {
             return Err(anyhow::anyhow!("Invalid screen index: {}", screen_index));
         }
+
+        // 保存屏幕配置
+        let config = ScreenConfig {
+            screen_index,
+            rects: rects.clone(),
+            transforms: transforms.clone(),
+        };
+
+        // 更新或添加屏幕配置
+        if let Some(existing) = self.screen_configs.iter_mut().find(|c| c.screen_index == screen_index) {
+            *existing = config;
+        } else {
+            self.screen_configs.push(config);
+        }
+
         self.captured_rects = rects;
         self.transforms = transforms;
         Ok(())
@@ -145,5 +169,18 @@ impl Renderer {
     #[allow(dead_code)]
     pub fn get_transforms(&self) -> &[Transform] {
         &self.transforms
+    }
+
+    pub fn get_screen_configs(&self) -> &[ScreenConfig] {
+        &self.screen_configs
+    }
+
+    // 计算变换后的矩形
+    pub fn compute_transformed_rect(rect: &Rect, transform: &Transform) -> (i32, i32, u32, u32) {
+        let x = (rect.x as f64 * transform.scale_x + transform.translate_x) as i32;
+        let y = (rect.y as f64 * transform.scale_y + transform.translate_y) as i32;
+        let width = (rect.width as f64 * transform.scale_x) as u32;
+        let height = (rect.height as f64 * transform.scale_y) as u32;
+        (x, y, width, height)
     }
 }

@@ -15,6 +15,63 @@
   - 获取屏幕参数信息
   - 开启/关闭输入功能
 
+## 当前状态
+
+**已实现功能**：
+- Socket 通信协议（裁切、变换、多屏幕控制 API）
+- 环境变量传递（`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, `MYDE_WRAP_SOCKET`）
+- 屏幕信息获取
+- 命令行参数解析
+- 渲染缓冲区管理（软件渲染）
+- DRM 设备检测和初始化
+- Wayland compositor 核心框架（smithay 0.7）
+- shm 缓冲区接收
+- dmabuf 协议支持
+- 离屏合成（支持 subsurface）
+- DRM 渲染输出（dumb buffer）
+- 裁切和变换渲染逻辑
+- 多屏幕输出支持
+
+**待实现**：
+- GBM 缓冲区管理
+- DrmCompositor 集成
+- 输入事件处理
+
+## 核心功能说明
+
+本项目不是普通的 Wayland 全屏显示，而是支持：
+
+1. **窗口裁切**：从应用渲染画面中截取指定矩形区域
+2. **缩放变换**：对裁切区域进行缩放处理
+3. **平移变换**：对裁切区域进行平移处理
+4. **多屏幕输出**：将变换后的区域分别渲染到不同屏幕
+
+## 技术架构
+
+- **smithay** (v0.7): Wayland compositor 框架
+- **wayland-server** (v0.31): Wayland 协议实现
+- **drm** (v0.14): DRM 设备控制
+- **gbm** (v0.18): GBM 缓冲区管理
+- **wayland-protocols** (v0.32): Wayland 协议扩展
+
+## 运行
+
+```bash
+# 以 root 权限运行（需要访问 DRM 设备）
+sudo myde-wrap <command> [args...]
+
+# 或者将用户添加到 video 组
+sudo usermod -aG video $USER
+# 重新登录后
+myde-wrap <command> [args...]
+
+# 示例
+sudo myde-wrap alacritty
+sudo myde-wrap glxgears
+```
+
+**注意**: DRM 渲染需要 root 权限或用户在 video 组中。
+
 ## 快速开始
 
 ### 编译
@@ -26,20 +83,28 @@ cargo build --release
 ### 运行
 
 ```bash
-# 运行指定程序
+# 以 root 权限运行（需要访问 DRM 设备）
+sudo myde-wrap <command> [args...]
+
+# 或者将用户添加到 video 组
+sudo usermod -aG video $USER
+# 重新登录后
 myde-wrap <command> [args...]
 
 # 示例
-myde-wrap firefox
-myde-wrap alacritty
-myde-wrap glxgears
+sudo myde-wrap alacritty
+sudo myde-wrap glxgears
 ```
+
+**注意**: DRM 渲染需要 root 权限或用户在 video 组中。
 
 程序启动后会：
 1. 自动检测默认显示器分辨率
 2. 创建 Socket 并设置环境变量 `MYDE_WRAP_SOCKET`
-3. 启动指定的应用程序
-4. 应用立即显示在默认显示器上，裁取范围为整个窗口（分辨率匹配显示器）
+3. 设置 Wayland 环境变量 `WAYLAND_DISPLAY` 和 `XDG_SESSION_TYPE`
+4. 继承父进程所有环境变量，确保应用能正常访问显示服务
+5. 启动指定的应用程序
+6. 应用立即显示在默认显示器上，裁取范围为整个窗口（分辨率匹配显示器）
 
 ### 默认行为
 
@@ -47,6 +112,16 @@ myde-wrap glxgears
 - **窗口大小**: 以显示器分辨率为准（如 1920x1080）
 - **裁取范围**: 整个窗口（`x=0, y=0, width=屏幕宽度, height=屏幕高度`）
 - **变换**: 无变换（`scale_x=1.0, scale_y=1.0, translate_x=0, translate_y=0`）
+
+### 环境变量
+
+程序会自动设置以下环境变量，并继承父进程的所有环境变量：
+
+- `MYDE_WRAP_SOCKET`: Socket 文件路径
+- `WAYLAND_DISPLAY`: Wayland 显示名称（默认 `wayland-0`）
+- `XDG_SESSION_TYPE`: 会话类型（默认 `wayland`）
+
+子进程会继承所有环境变量，确保能正常访问 X11/Wayland 显示服务。
 
 ### 连接 Socket
 

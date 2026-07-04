@@ -14,21 +14,35 @@ src/
 ├── protocol.rs      # 协议数据结构定义
 ├── socket.rs        # Unix Socket 服务端实现
 ├── compositor.rs    # 消息处理和业务逻辑
-└── renderer.rs      # 渲染状态和屏幕管理
+├── renderer.rs      # 渲染状态和屏幕管理
+└── wayland.rs       # Wayland compositor 核心（DRM 渲染）
 ```
 
 ### 数据流
 
 ```
 客户端 → Socket → read_message() → Compositor.handle_message() → Renderer → write_message() → 客户端
+
+DRM 渲染流程：
+WaylandCompositor.dispatch() → render_to_drm() → DumbBuffer → CRTC → 屏幕
+
+多屏幕渲染流程：
+Renderer.get_screen_configs() → 遍历每个屏幕 → 计算变换矩形 → render_rect_to_screen()
+
+核心功能流程：
+应用渲染 → shm buffer → 裁切指定区域 → 缩放/平移变换 → 渲染到指定屏幕
 ```
 
 ### 关键依赖
 
-- **smithay** (v0.3): Wayland 合成器框架
+- **smithay** (v0.7): Wayland 合成器框架
 - **tokio** (v1): 异步运行时，用于主事件循环
 - **serde** / **serde_json**: JSON 序列化/反序列化
 - **tracing**: 结构化日志
+- **drm** (v0.14): DRM 设备控制
+- **gbm** (v0.18): GBM 缓冲区管理
+- **wayland-server** (v0.31): Wayland 服务端
+- **wayland-protocols** (v0.32): Wayland 协议扩展
 
 ## 开发指南
 

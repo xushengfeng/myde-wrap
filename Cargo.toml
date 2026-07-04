@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-smithay = { version = "0.3", features = ["backend_winit", "renderer_gl", "wayland_frontend"] }
+smithay = { version = "0.7", features = ["backend_drm", "backend_gbm", "backend_udev", "renderer_gl", "wayland_frontend"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -12,3 +12,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+drm = "0.12"
+gbm = "0.15"
+nix = { version = "0.29", features = ["mman"] }
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server"] }
