@@ -29,12 +29,16 @@ impl Compositor {
                 renderer.transform_rects(transforms);
                 ServerResponse::RectsTransformed
             }
-            ClientMessage::RenderToScreen { screen_index, rects, transforms } => {
-                match renderer.render_to_screen(screen_index, rects, transforms) {
-                    Ok(()) => ServerResponse::RenderedToScreen { screen_index },
-                    Err(e) => ServerResponse::Error { message: e.to_string() },
-                }
-            }
+            ClientMessage::RenderToScreen {
+                screen_index,
+                rects,
+                transforms,
+            } => match renderer.render_to_screen(screen_index, rects, transforms) {
+                Ok(()) => ServerResponse::RenderedToScreen { screen_index },
+                Err(e) => ServerResponse::Error {
+                    message: e.to_string(),
+                },
+            },
             ClientMessage::GetScreens => {
                 let screens = renderer.get_screens();
                 ServerResponse::Screens { screens }

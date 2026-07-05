@@ -1,17 +1,16 @@
 use smithay::{
-    desktop::{PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords},
-    input::{
-        Seat,
-        pointer::{Focus, GrabStartData as PointerGrabStartData},
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
     },
+    input::{pointer::GrabStartData as PointerGrabStartData, Seat},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Resource,
             protocol::{wl_seat, wl_surface::WlSurface},
+            Resource,
         },
     },
-    utils::{Logical, Rectangle, Serial},
+    utils::Serial,
     wayland::{
         compositor::with_states,
         shell::xdg::{
@@ -29,8 +28,13 @@ impl XdgShellHandler for App {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        tracing::info!("New toplevel surface created: {:?}", surface.wl_surface());
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window, (0, 0), false);
+        tracing::info!(
+            "Window mapped to space, total windows: {}",
+            self.space.elements().count()
+        );
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -38,7 +42,12 @@ impl XdgShellHandler for App {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             let geometry = positioner.get_geometry();
             state.geometry = geometry;
@@ -54,8 +63,8 @@ impl XdgShellHandler for App {
         let seat = Seat::from_resource(&seat).unwrap();
         let wl_surface = surface.wl_surface();
 
-        if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
-            let pointer = seat.get_pointer().unwrap();
+        if let Some(_start_data) = check_grab(&seat, wl_surface, serial) {
+            let _pointer = seat.get_pointer().unwrap();
             let window = self
                 .space
                 .elements()
@@ -75,13 +84,13 @@ impl XdgShellHandler for App {
         surface: ToplevelSurface,
         seat: wl_seat::WlSeat,
         serial: Serial,
-        edges: xdg_toplevel::ResizeEdge,
+        _edges: xdg_toplevel::ResizeEdge,
     ) {
         let seat = Seat::from_resource(&seat).unwrap();
         let wl_surface = surface.wl_surface();
 
-        if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
-            let pointer = seat.get_pointer().unwrap();
+        if let Some(_start_data) = check_grab(&seat, wl_surface, serial) {
+            let _pointer = seat.get_pointer().unwrap();
             let window = self
                 .space
                 .elements()
@@ -99,7 +108,11 @@ impl XdgShellHandler for App {
             surface.send_pending_configure();
 
             // For now, just log the resize request
-            tracing::info!("Resize request for window at {:?} size {:?}", initial_window_location, initial_window_size);
+            tracing::info!(
+                "Resize request for window at {:?} size {:?}",
+                initial_window_location,
+                initial_window_size
+            );
         }
     }
 

@@ -3,7 +3,8 @@ use std::time::Duration;
 use smithay::{
     backend::{
         renderer::{
-            damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer,
+            damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement,
+            gles::GlesRenderer,
         },
         winit::{self, WinitEvent},
     },
@@ -12,9 +13,9 @@ use smithay::{
     utils::{Rectangle, Transform as SmithayTransform},
 };
 
-use crate::wayland::App;
 use crate::backend::RenderBackend;
 use crate::protocol::Transform;
+use crate::wayland::App;
 
 pub struct WinitBackend {
     width: u32,
@@ -37,7 +38,11 @@ impl RenderBackend for WinitBackend {
         "winit"
     }
 
-    fn init(&mut self, event_loop: &mut EventLoop<App>, state: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    fn init(
+        &mut self,
+        event_loop: &mut EventLoop<App>,
+        state: &mut App,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut backend, winit) = winit::init()?;
 
         let mode = Mode {
@@ -59,7 +64,12 @@ impl RenderBackend for WinitBackend {
         );
         let _global = output.create_global::<App>(&state.display_handle);
 
-        output.change_current_state(Some(mode), Some(SmithayTransform::Flipped180), None, Some((0, 0).into()));
+        output.change_current_state(
+            Some(mode),
+            Some(SmithayTransform::Flipped180),
+            None,
+            Some((0, 0).into()),
+        );
         output.set_preferred(mode);
 
         state.space.map_output(&output, (0, 0));
@@ -68,78 +78,96 @@ impl RenderBackend for WinitBackend {
 
         let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
-        event_loop.handle().insert_source(winit, move |event, _, state| {
-            match event {
-                WinitEvent::Resized { size, .. } => {
-                    output.change_current_state(
-                        Some(Mode {
-                            size,
-                            refresh: 60_000,
-                        }),
-                        None,
-                        None,
-                        None,
-                    );
-                }
-                WinitEvent::Input(event) => state.process_input_event(event),
-                WinitEvent::Redraw => {
-                    let size = backend.window_size();
-                    let damage = Rectangle::from_size(size);
-
-                    {
-                        let (renderer, mut framebuffer) = backend.bind().unwrap();
-                        smithay::desktop::space::render_output::<
-                            _,
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                            _,
-                            _,
-                        >(
-                            &output,
-                            renderer,
-                            &mut framebuffer,
-                            1.0,
-                            0,
-                            [&state.space],
-                            &[],
-                            &mut damage_tracker,
-                            [0.1, 0.1, 0.1, 1.0],
-                        )
-                        .unwrap();
+        event_loop
+            .handle()
+            .insert_source(winit, move |event, _, state| {
+                match event {
+                    WinitEvent::Resized { size, .. } => {
+                        output.change_current_state(
+                            Some(Mode {
+                                size,
+                                refresh: 60_000,
+                            }),
+                            None,
+                            None,
+                            None,
+                        );
                     }
+                    WinitEvent::Input(event) => state.process_input_event(event),
+                    WinitEvent::Redraw => {
+                        let size = backend.window_size();
+                        let damage = Rectangle::from_size(size);
 
-                    backend.submit(Some(&[damage])).unwrap();
+                        {
+                            let (renderer, mut framebuffer) = backend.bind().unwrap();
+                            smithay::desktop::space::render_output::<
+                                _,
+                                WaylandSurfaceRenderElement<GlesRenderer>,
+                                _,
+                                _,
+                            >(
+                                &output,
+                                renderer,
+                                &mut framebuffer,
+                                1.0,
+                                0,
+                                [&state.space],
+                                &[],
+                                &mut damage_tracker,
+                                [0.1, 0.1, 0.1, 1.0],
+                            )
+                            .unwrap();
+                        }
 
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        )
-                    });
+                        backend.submit(Some(&[damage])).unwrap();
 
-                    state.space.refresh();
-                    state.popups.cleanup();
+                        state.space.elements().for_each(|window| {
+                            window.send_frame(
+                                &output,
+                                state.start_time.elapsed(),
+                                Some(Duration::ZERO),
+                                |_, _| Some(output.clone()),
+                            )
+                        });
 
-                    let _ = state.display_handle.flush_clients();
+                        state.space.refresh();
+                        state.popups.cleanup();
 
-                    // Ask for redraw to schedule new frame.
-                    backend.window().request_redraw();
-                }
-                WinitEvent::CloseRequested => {
-                    state.loop_signal.stop();
-                }
-                _ => (),
-            };
-        })?;
+                        let _ = state.display_handle.flush_clients();
+
+                        // Ask for redraw to schedule new frame.
+                        backend.window().request_redraw();
+                    }
+                    WinitEvent::CloseRequested => {
+                        state.loop_signal.stop();
+                    }
+                    _ => (),
+                };
+            })?;
 
         Ok(())
     }
 
-    fn render_rect(&mut self, screen_index: usize, x: i32, y: i32, width: u32, height: u32, transform: &Transform) {
+    fn render_rect(
+        &mut self,
+        screen_index: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        transform: &Transform,
+    ) {
         // Winit backend handles rendering through the event loop
         // This is a no-op for winit backend
-        tracing::debug!("WinitBackend::render_rect({}, {}, {}, {}, {}, {:?})", screen_index, x, y, width, height, transform);
+        tracing::debug!(
+            "WinitBackend::render_rect({}, {}, {}, {}, {}, {:?})",
+            screen_index,
+            x,
+            y,
+            width,
+            height,
+            transform
+        );
     }
 
     fn dispatch(&mut self) {
@@ -155,6 +183,15 @@ impl RenderBackend for WinitBackend {
     }
 
     fn get_output_count(&self) -> usize {
-        if self.output.is_some() { 1 } else { 0 }
+        if self.output.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn render_space(&mut self, _state: &mut App) {
+        // Winit backend handles rendering through its own event loop (WinitEvent::Redraw)
+        // so this is a no-op here.
     }
 }

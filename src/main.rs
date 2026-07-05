@@ -1,23 +1,35 @@
-mod protocol;
-mod socket;
-mod renderer;
-mod compositor;
-mod wayland;
 mod backend;
-mod winit;
+mod compositor;
 mod drm;
 mod handlers;
+mod protocol;
+mod renderer;
+mod socket;
+mod wayland;
+mod winit;
 
-use std::process::Command;
-use tracing::{info, error};
 use clap::Parser;
-use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
+use smithay::reexports::{
+    calloop::{
+        timer::{TimeoutAction, Timer},
+        EventLoop,
+    },
+    wayland_server::Display,
+};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tracing::{error, info};
 
+use crate::backend::RenderBackend;
+use crate::compositor::Compositor;
+use crate::drm::DrmBackend;
+use crate::protocol::ClientMessage;
+use crate::renderer::Renderer as MyRenderer;
 use crate::socket::SocketServer;
 use crate::wayland::App;
-use crate::backend::RenderBackend;
 use crate::winit::WinitBackend;
-use crate::drm::DrmBackend;
 
 #[derive(Parser)]
 #[command(name = "myde-wrap")]
@@ -54,6 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let display: Display<App> = Display::new()?;
     let mut state = App::new(&mut event_loop, display);
+
+    let is_drm = args.backend.as_str() == "drm";
 
     // Create and initialize the selected backend
     let mut backend: Box<dyn RenderBackend> = match args.backend.as_str() {
@@ -93,11 +107,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
     // 确保 socket 环境变量存在
     if !envs.iter().any(|(k, _)| k == "MYDE_WRAP_SOCKET") {
-        envs.push(("MYDE_WRAP_SOCKET".to_string(), socket_path.to_str().unwrap().to_string()));
+        envs.push((
+            "MYDE_WRAP_SOCKET".to_string(),
+            socket_path.to_str().unwrap().to_string(),
+        ));
     }
     // 确保 Wayland 环境变量存在
     if !envs.iter().any(|(k, _)| k == "WAYLAND_DISPLAY") {
-        envs.push(("WAYLAND_DISPLAY".to_string(), state.socket_name.to_str().unwrap().to_string()));
+        envs.push((
+            "WAYLAND_DISPLAY".to_string(),
+            state.socket_name.to_str().unwrap().to_string(),
+        ));
     }
     // 确保 XDG_SESSION_TYPE 环境变量存在
     if !envs.iter().any(|(k, _)| k == "XDG_SESSION_TYPE") {
@@ -120,9 +140,134 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // 将Socket服务器添加到事件循环中
+    let loop_handle = event_loop.handle();
+    let socket_server = Arc::new(socket_server);
+    let renderer = Arc::new(Mutex::new(MyRenderer::new()));
+    let compositor = Arc::new(Compositor::new(renderer.clone()));
+    let backend = Arc::new(Mutex::new(backend));
+
+    // 克隆socket_server以在事件循环中使用
+    let socket_server_clone = socket_server.clone();
+    let backend_clone = backend.clone();
+
+    // 创建一个channel来传递socket连接
+    let (tx, rx) = smithay::reexports::calloop::channel::channel();
+
+    // 在单独的线程中接受socket连接
+    std::thread::spawn(move || loop {
+        if let Some(stream) = socket_server_clone.accept() {
+            let _ = tx.send(stream);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    });
+
+    // 在事件循环中处理socket消息
+    loop_handle.insert_source(rx, move |event, _, state| {
+        match event {
+            smithay::reexports::calloop::channel::Event::Msg(mut stream) => {
+                info!("收到新的socket连接");
+
+                // 读取消息
+                match socket::read_message(&mut stream) {
+                    Ok(msg) => {
+                        info!("收到消息: {:?}", msg);
+
+                        // 处理消息
+                        let response = tokio::runtime::Runtime::new()
+                            .unwrap()
+                            .block_on(compositor.handle_message(msg.clone()));
+
+                        // 发送响应
+                        if let Err(e) = socket::write_message(&mut stream, &response) {
+                            error!("发送响应失败: {}", e);
+                        }
+
+                        // 处理渲染
+                        match msg {
+                            ClientMessage::RenderToScreen {
+                                screen_index,
+                                rects,
+                                transforms,
+                            } => {
+                                // 设置自定义配置标志
+                                state.has_custom_config = true;
+
+                                // 处理渲染到屏幕
+                                let mut backend_guard = backend_clone.blocking_lock();
+                                for (i, rect) in rects.iter().enumerate() {
+                                    let transform = transforms.get(i).cloned().unwrap_or_default();
+                                    backend_guard.render_rect(
+                                        screen_index,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &transform,
+                                    );
+                                }
+                            }
+                            ClientMessage::SetWindowSize { width, height } => {
+                                // 处理窗口大小设置
+                                info!("设置窗口大小: {}x{}", width, height);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        error!("读取消息失败: {}", e);
+                    }
+                }
+            }
+            smithay::reexports::calloop::channel::Event::Closed => {
+                error!("Socket连接关闭");
+            }
+        }
+    })?;
+
+    // For DRM backend, add a timer to periodically render the space
+    let backend_for_render = backend.clone();
+    if is_drm {
+        // Create a timer that fires immediately and then every 16ms (~60fps)
+        let timer = Timer::immediate();
+        loop_handle.insert_source(timer, move |_event, _, state| {
+            let mut backend_guard = backend_for_render.blocking_lock();
+            backend_guard.dispatch();
+            backend_guard.render_space(state);
+            TimeoutAction::ToDuration(Duration::from_millis(16)) // ~60fps
+        })?;
+    }
+
+    // 设置默认全屏显示
+    // 如果没有自定义配置，默认全屏显示应用到所有屏幕
+    let renderer_clone = renderer.clone();
+    let backend_for_default = backend.clone();
+
+    // 在单独的线程中设置默认全屏显示
+    std::thread::spawn(move || {
+        // 等待一小段时间让应用启动
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // 获取渲染器配置
+        let renderer = renderer_clone.blocking_lock();
+        let backend_guard = backend_for_default.blocking_lock();
+        let backend_output_count = backend_guard.get_output_count();
+
+        // 为每个屏幕设置默认全屏配置
+        for screen_index in 0..backend_output_count {
+            let config = renderer.get_default_fullscreen_config(screen_index);
+            info!(
+                "设置默认全屏配置: 屏幕 {}, 矩形 {:?}, 变换 {:?}",
+                screen_index, config.rects, config.transforms
+            );
+        }
+    });
+
     // Run the event loop
+    info!("Starting event loop...");
     event_loop.run(None, &mut state, move |_| {
-        // myde-wrap is running
+        // Wayland events are handled by the display source in init_wayland_listener
+        // DRM rendering is handled by the timer above
     })?;
 
     Ok(())

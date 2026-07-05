@@ -2,13 +2,14 @@ use crate::wayland::{App, ClientState};
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     reexports::wayland_server::{
-        Client,
         protocol::{wl_buffer, wl_surface::WlSurface},
+        Client,
     },
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
+            get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler,
+            CompositorState,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -39,7 +40,10 @@ impl CompositorHandler for App {
                 .elements()
                 .find(|w| w.toplevel().unwrap().wl_surface() == &root)
             {
+                tracing::debug!("Commit for window surface: {:?}", surface);
                 window.on_commit();
+            } else {
+                tracing::debug!("Commit for unknown surface: {:?}", surface);
             }
         };
 

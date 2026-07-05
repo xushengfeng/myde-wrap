@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::protocol::{ClientMessage, ServerResponse};
 

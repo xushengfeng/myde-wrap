@@ -1,4 +1,4 @@
-use crate::protocol::{Rect, Transform, ScreenInfo};
+use crate::protocol::{Rect, ScreenInfo, Transform};
 use tracing::info;
 
 pub struct Renderer {
@@ -25,7 +25,10 @@ impl Renderer {
         let window_width = default_screen.width;
         let window_height = default_screen.height;
 
-        info!("默认显示器: {} ({}x{})", default_screen.name, window_width, window_height);
+        info!(
+            "默认显示器: {} ({}x{})",
+            default_screen.name, window_width, window_height
+        );
 
         let captured_rects = vec![Rect {
             x: 0,
@@ -54,10 +57,7 @@ impl Renderer {
 
     fn detect_screens() -> Vec<ScreenInfo> {
         // 尝试从环境变量获取屏幕信息
-        if let Ok(output) = std::process::Command::new("xrandr")
-            .arg("--query")
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("xrandr").arg("--query").output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut screens = Vec::new();
 
@@ -72,10 +72,9 @@ impl Renderer {
                             let res_part = part.split('+').next().unwrap_or("");
                             let dims: Vec<&str> = res_part.split('x').collect();
                             if dims.len() == 2 {
-                                if let (Ok(width), Ok(height)) = (
-                                    dims[0].parse::<u32>(),
-                                    dims[1].parse::<u32>(),
-                                ) {
+                                if let (Ok(width), Ok(height)) =
+                                    (dims[0].parse::<u32>(), dims[1].parse::<u32>())
+                                {
                                     screens.push(ScreenInfo {
                                         name,
                                         width,
@@ -124,7 +123,12 @@ impl Renderer {
         self.transforms = transforms;
     }
 
-    pub fn render_to_screen(&mut self, screen_index: usize, rects: Vec<Rect>, transforms: Vec<Transform>) -> anyhow::Result<()> {
+    pub fn render_to_screen(
+        &mut self,
+        screen_index: usize,
+        rects: Vec<Rect>,
+        transforms: Vec<Transform>,
+    ) -> anyhow::Result<()> {
         if screen_index >= self.screens.len() {
             return Err(anyhow::anyhow!("Invalid screen index: {}", screen_index));
         }
@@ -137,7 +141,11 @@ impl Renderer {
         };
 
         // 更新或添加屏幕配置
-        if let Some(existing) = self.screen_configs.iter_mut().find(|c| c.screen_index == screen_index) {
+        if let Some(existing) = self
+            .screen_configs
+            .iter_mut()
+            .find(|c| c.screen_index == screen_index)
+        {
             *existing = config;
         } else {
             self.screen_configs.push(config);
@@ -173,6 +181,56 @@ impl Renderer {
 
     pub fn get_screen_configs(&self) -> &[ScreenConfig] {
         &self.screen_configs
+    }
+
+    // 获取默认的全屏配置
+    pub fn get_default_fullscreen_config(&self, screen_index: usize) -> ScreenConfig {
+        if screen_index >= self.screens.len() {
+            return ScreenConfig {
+                screen_index,
+                rects: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width: self.window_width,
+                    height: self.window_height,
+                }],
+                transforms: vec![Transform {
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    translate_x: 0.0,
+                    translate_y: 0.0,
+                }],
+            };
+        }
+
+        let screen = &self.screens[screen_index];
+
+        // 计算缩放比例以适应屏幕
+        let scale_x = screen.width as f64 / self.window_width as f64;
+        let scale_y = screen.height as f64 / self.window_height as f64;
+        let scale = scale_x.min(scale_y);
+
+        // 计算居中偏移
+        let scaled_width = self.window_width as f64 * scale;
+        let scaled_height = self.window_height as f64 * scale;
+        let translate_x = (screen.width as f64 - scaled_width) / 2.0;
+        let translate_y = (screen.height as f64 - scaled_height) / 2.0;
+
+        ScreenConfig {
+            screen_index,
+            rects: vec![Rect {
+                x: 0,
+                y: 0,
+                width: self.window_width,
+                height: self.window_height,
+            }],
+            transforms: vec![Transform {
+                scale_x: scale,
+                scale_y: scale,
+                translate_x,
+                translate_y,
+            }],
+        }
     }
 
     // 计算变换后的矩形

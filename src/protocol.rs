@@ -42,6 +42,17 @@ pub struct Transform {
     pub translate_y: f64,
 }
 
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+        }
+    }
+}
+
 /// 屏幕信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenInfo {
@@ -58,12 +69,25 @@ pub struct ScreenInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    SetWindowSize { width: u32, height: u32 },
-    CaptureRects { rects: Vec<Rect> },
-    TransformRects { transforms: Vec<Transform> },
-    RenderToScreen { screen_index: usize, rects: Vec<Rect>, transforms: Vec<Transform> },
+    SetWindowSize {
+        width: u32,
+        height: u32,
+    },
+    CaptureRects {
+        rects: Vec<Rect>,
+    },
+    TransformRects {
+        transforms: Vec<Transform>,
+    },
+    RenderToScreen {
+        screen_index: usize,
+        rects: Vec<Rect>,
+        transforms: Vec<Transform>,
+    },
     GetScreens,
-    SetInputEnabled { enabled: bool },
+    SetInputEnabled {
+        enabled: bool,
+    },
     Ping,
 }
 

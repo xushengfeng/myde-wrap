@@ -1,16 +1,16 @@
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{info, error};
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
-    input::{Seat, SeatHandler, SeatState},
+    input::{Seat, SeatState},
     reexports::{
-        calloop::{EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction, generic::Generic},
+        calloop::{
+            generic::Generic, EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
+        },
         wayland_server::{
-            Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
+            Display, DisplayHandle,
         },
     },
     utils::{Logical, Point},
@@ -24,16 +24,13 @@ use smithay::{
     },
 };
 
-use crate::protocol::{Rect, Transform as MyTransform, ScreenInfo};
-use crate::renderer::Renderer as MyRenderer;
-
 pub struct App {
     pub start_time: std::time::Instant,
     pub socket_name: std::ffi::OsString,
     pub display_handle: DisplayHandle,
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
-    
+
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -43,6 +40,9 @@ pub struct App {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
+
+    // 自定义配置状态
+    pub has_custom_config: bool,
 }
 
 impl App {
@@ -103,10 +103,14 @@ impl App {
             data_device_state,
             popups,
             seat,
+            has_custom_config: false,
         }
     }
 
-    fn init_wayland_listener(display: Display<App>, event_loop: &mut EventLoop<Self>) -> std::ffi::OsString {
+    fn init_wayland_listener(
+        display: Display<App>,
+        event_loop: &mut EventLoop<Self>,
+    ) -> std::ffi::OsString {
         // Creates a new listening socket, automatically choosing the next available `wayland` socket name.
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
 
@@ -120,10 +124,14 @@ impl App {
                 // Inside the callback, you should insert the client into the display.
                 //
                 // You may also associate some data with the client when inserting the client.
-                state
+                tracing::info!("New Wayland client connecting");
+                match state
                     .display_handle
                     .insert_client(client_stream, Arc::new(ClientState::default()))
-                    .unwrap();
+                {
+                    Ok(_) => tracing::info!("Wayland client connected successfully"),
+                    Err(e) => tracing::error!("Failed to connect Wayland client: {}", e),
+                }
             })
             .expect("Failed to init the wayland event source.");
 
@@ -135,6 +143,7 @@ impl App {
                     // Safety: we don't drop the display
                     unsafe {
                         display.get_mut().dispatch_clients(state).unwrap();
+                        display.get_mut().flush_clients().unwrap();
                     }
                     Ok(PostAction::Continue)
                 },
@@ -144,15 +153,23 @@ impl App {
         socket_name
     }
 
-    pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p + location).to_f64()))
-        })
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.space
+            .element_under(pos)
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64()))
+            })
     }
 
-    pub fn process_input_event(&mut self, event: smithay::backend::input::InputEvent<smithay::backend::winit::WinitInput>) {
+    pub fn process_input_event(
+        &mut self,
+        event: smithay::backend::input::InputEvent<smithay::backend::winit::WinitInput>,
+    ) {
         // Handle input events
         match event {
             smithay::backend::input::InputEvent::Keyboard { event } => {
@@ -185,4 +202,3 @@ impl ClientData for ClientState {
 }
 
 // Re-export for use in other modules
-pub use smithay::reexports::wayland_server::Display as WaylandDisplay;
