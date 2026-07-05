@@ -63,6 +63,8 @@ pub struct DrmBackend {
     rx: Option<std::sync::mpsc::Receiver<()>>,
     tx: Option<std::sync::mpsc::Sender<()>>,
     needs_vblank: bool,
+    pub rotate_shader: Option<smithay::backend::renderer::gles::GlesTexProgram>,
+    pub offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture>,
 }
 
 // SAFETY: GlesRenderer contains raw pointers that are not Send, but it's safe to send
@@ -87,6 +89,8 @@ impl DrmBackend {
             rx: Some(rx),
             tx: Some(tx),
             needs_vblank: false,
+            rotate_shader: None,
+            offscreen_texture: None,
         }
     }
 }
@@ -219,7 +223,78 @@ impl RenderBackend for DrmBackend {
         // Create EGL display from GBM device
         let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
         let egl_context = EGLContext::new(&egl_display)?;
-        let renderer = unsafe { GlesRenderer::new(egl_context)? };
+        let egl_context = EGLContext::new(&egl_display)?;
+        let mut renderer = unsafe { GlesRenderer::new(egl_context)? };
+
+        let shader = renderer.compile_custom_texture_shader(
+            r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision mediump float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+varying vec2 v_coords;
+uniform float custom_rotation;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+void main() {
+    float c = cos(custom_rotation);
+    float s = sin(custom_rotation);
+    
+    // Rotate around (0.0, 0.0) which corresponds to rect.xy (top-left of the screen)
+    vec2 p = v_coords;
+    vec2 rp = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+    vec2 uv = rp;
+
+    vec4 color;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        color = vec4(0.0);
+    } else {
+        color = texture2D(tex, uv);
+    }
+
+#if defined(NO_ALPHA)
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
+#endif
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+
+    gl_FragColor = color;
+}
+"#,
+            &[smithay::backend::renderer::gles::UniformName::new(
+                "custom_rotation",
+                smithay::backend::renderer::gles::UniformType::_1f,
+            )],
+        )?;
+
+        let offscreen_size = smithay::utils::Size::from((self.width as i32, self.height as i32));
+        use smithay::backend::renderer::Offscreen;
+        let offscreen_texture = renderer
+            .create_buffer(
+                smithay::backend::allocator::Fourcc::Argb8888,
+                offscreen_size,
+            )
+            .ok();
 
         // Create DRM compositor for the first output
         let first_output = &self.outputs[0];
@@ -266,6 +341,8 @@ impl RenderBackend for DrmBackend {
         self.gbm = Some(gbm);
         self.renderer = Some(renderer);
         self.drm_compositor = Some(drm_compositor);
+        self.rotate_shader = Some(shader);
+        self.offscreen_texture = offscreen_texture;
 
         info!(
             "DRM backend initialized, found {} outputs",
@@ -319,7 +396,7 @@ impl RenderBackend for DrmBackend {
         self.outputs.len()
     }
 
-    fn render_space(&mut self, state: &mut App) {
+    fn render_space(&mut self, state: &mut App, configs: &[crate::renderer::ScreenConfig]) {
         if self.needs_vblank {
             return;
         }
@@ -354,50 +431,125 @@ impl RenderBackend for DrmBackend {
             info!("  xdg_shell_state has {} toplevel surfaces", toplevel_count);
         }
 
+        let output_data = &self.outputs[0];
+        let screen_index = 0; // For now we only render the first DRM output
+
+        // Find config for this screen
+        let config = configs.iter().find(|c| c.screen_index == screen_index);
+
+        let mut scale_x = 1.0;
+        let mut scale_y = 1.0;
+        let mut loc_x = 0;
+        let mut loc_y = 0;
+        let mut rotation = 0.0;
+
+        if let Some(config) = config {
+            if let Some(rect) = config.rects.first() {
+                let screen_w = output_data.width as f64;
+                let screen_h = output_data.height as f64;
+
+                scale_x = screen_w / (rect.width as f64).max(1.0);
+                scale_y = screen_h / (rect.height as f64).max(1.0);
+
+                loc_x = -(rect.x as f64 * scale_x).round() as i32;
+                loc_y = -(rect.y as f64 * scale_y).round() as i32;
+            }
+            if let Some(transform) = config.transforms.first() {
+                rotation = transform.rotation;
+            }
+        }
+
+        // Update output transform based on rotation
+        let transform = match rotation {
+            r if (r >= 45.0 && r < 135.0) || (r <= -225.0 && r > -315.0) => {
+                smithay::utils::Transform::_90
+            }
+            r if (r >= 135.0 && r < 225.0) || (r <= -135.0 && r > -225.0) => {
+                smithay::utils::Transform::_180
+            }
+            r if (r >= 225.0 && r < 315.0) || (r <= -45.0 && r > -135.0) => {
+                smithay::utils::Transform::_270
+            }
+            _ => smithay::utils::Transform::Normal,
+        };
+        output_data
+            .smithay_output
+            .change_current_state(None, Some(transform), None, None);
+
         // Collect render elements from all windows in the space
         let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
             .space
             .elements()
             .flat_map(|window| {
                 let surface = window.toplevel().unwrap().wl_surface().clone();
-                if self.frame_count <= 10 {
-                    info!(
-                        "Frame {}: Collecting elements from surface {:?}",
-                        self.frame_count, surface
-                    );
-                }
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    (0, 0),
-                    1.0,
+                    (loc_x, loc_y),
+                    smithay::utils::Scale::from((scale_x, scale_y)),
                     1.0,
                     smithay::backend::renderer::element::Kind::Unspecified,
                 )
             })
             .collect();
 
-        if self.frame_count <= 10 || self.frame_count % 60 == 0 {
-            info!(
-                "Frame {}: {} elements collected for rendering",
-                self.frame_count,
-                elements.len()
-            );
-            for (i, elem) in elements.iter().enumerate() {
-                info!(
-                    "  Element {}: id={:?}, geometry={:?}, kind={:?}",
-                    i,
-                    elem.id(),
-                    elem.geometry(1.0.into()),
-                    elem.kind()
+        // If we have an offscreen texture and a rotate shader, render to it first
+        let mut final_elements: Vec<crate::custom_element::CustomRotatedElement> = Vec::new();
+
+        if let (Some(tex), Some(shader)) =
+            (self.offscreen_texture.as_mut(), self.rotate_shader.as_ref())
+        {
+            use smithay::backend::renderer::{Bind, Frame, Renderer};
+            {
+                let mut target = renderer.bind(tex).unwrap();
+                let mut frame = renderer
+                    .render(
+                        &mut target,
+                        smithay::utils::Size::from((self.width as i32, self.height as i32)),
+                        smithay::utils::Transform::Normal,
+                    )
+                    .unwrap();
+
+                let damage = [smithay::utils::Rectangle::from_size(
+                    smithay::utils::Size::from((self.width as i32, self.height as i32)),
+                )];
+                let _ = frame.clear(
+                    smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 0.0),
+                    &damage,
                 );
+
+                for element in &elements {
+                    use smithay::backend::renderer::element::{Element, RenderElement};
+                    let _ = element.draw(
+                        &mut frame,
+                        element.src(),
+                        element.geometry(smithay::utils::Scale::from(1.0)),
+                        &damage,
+                        &[],
+                    );
+                }
             }
+
+            final_elements.push(crate::custom_element::CustomRotatedElement {
+                id: smithay::backend::renderer::element::Id::new(),
+                texture: tex.clone(),
+                src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                    self.width as f64,
+                    self.height as f64,
+                ))),
+                dst: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                    self.width as i32,
+                    self.height as i32,
+                ))),
+                rotation,
+                shader: shader.clone(),
+            });
         }
 
-        // Render frame - even with 0 elements to test if DRM output works
-        match compositor.render_frame::<_, WaylandSurfaceRenderElement<GlesRenderer>>(
+        // Render frame
+        match compositor.render_frame::<_, crate::custom_element::CustomRotatedElement>(
             renderer,
-            &elements,
+            &final_elements,
             [0.1, 0.1, 0.1, 1.0],
             FrameFlags::DEFAULT,
         ) {

@@ -1,4 +1,5 @@
 use crate::protocol::Transform;
+use crate::renderer::ScreenConfig;
 use crate::wayland::App;
 use smithay::reexports::calloop::EventLoop;
 
@@ -25,7 +26,7 @@ pub trait RenderBackend: Send {
 
     /// Render the Wayland space contents to the screen.
     /// This is called periodically to update the display with Wayland surfaces.
-    fn render_space(&mut self, _state: &mut App) {
+    fn render_space(&mut self, _state: &mut App, _configs: &[ScreenConfig]) {
         // Default implementation does nothing
     }
 

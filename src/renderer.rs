@@ -37,12 +37,7 @@ impl Renderer {
             height: window_height,
         }];
 
-        let transforms = vec![Transform {
-            scale_x: 1.0,
-            scale_y: 1.0,
-            translate_x: 0.0,
-            translate_y: 0.0,
-        }];
+        let transforms = vec![Transform { rotation: 0.0 }];
 
         Self {
             window_width,
@@ -194,27 +189,11 @@ impl Renderer {
                     width: self.window_width,
                     height: self.window_height,
                 }],
-                transforms: vec![Transform {
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    translate_x: 0.0,
-                    translate_y: 0.0,
-                }],
+                transforms: vec![Transform { rotation: 0.0 }],
             };
         }
 
         let screen = &self.screens[screen_index];
-
-        // 计算缩放比例以适应屏幕
-        let scale_x = screen.width as f64 / self.window_width as f64;
-        let scale_y = screen.height as f64 / self.window_height as f64;
-        let scale = scale_x.min(scale_y);
-
-        // 计算居中偏移
-        let scaled_width = self.window_width as f64 * scale;
-        let scaled_height = self.window_height as f64 * scale;
-        let translate_x = (screen.width as f64 - scaled_width) / 2.0;
-        let translate_y = (screen.height as f64 - scaled_height) / 2.0;
 
         ScreenConfig {
             screen_index,
@@ -224,21 +203,12 @@ impl Renderer {
                 width: self.window_width,
                 height: self.window_height,
             }],
-            transforms: vec![Transform {
-                scale_x: scale,
-                scale_y: scale,
-                translate_x,
-                translate_y,
-            }],
+            transforms: vec![Transform { rotation: 0.0 }],
         }
     }
 
-    // 计算变换后的矩形
-    pub fn compute_transformed_rect(rect: &Rect, transform: &Transform) -> (i32, i32, u32, u32) {
-        let x = (rect.x as f64 * transform.scale_x + transform.translate_x) as i32;
-        let y = (rect.y as f64 * transform.scale_y + transform.translate_y) as i32;
-        let width = (rect.width as f64 * transform.scale_x) as u32;
-        let height = (rect.height as f64 * transform.scale_y) as u32;
-        (x, y, width, height)
+    // 计算变换后的矩形（为了兼容旧接口，这里直接返回原矩形，因为拉伸由渲染器在渲染时负责）
+    pub fn compute_transformed_rect(rect: &Rect, _transform: &Transform) -> (i32, i32, u32, u32) {
+        (rect.x, rect.y, rect.width, rect.height)
     }
 }

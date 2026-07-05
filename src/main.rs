@@ -1,5 +1,6 @@
 mod backend;
 mod compositor;
+mod custom_element;
 mod drm;
 mod handlers;
 mod protocol;
@@ -230,10 +231,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_drm {
         // Create a timer that fires immediately and then every 16ms (~60fps)
         let timer = Timer::immediate();
+        let renderer_for_timer = renderer.clone();
         loop_handle.insert_source(timer, move |_event, _, state| {
             let mut backend_guard = backend_for_render.blocking_lock();
             backend_guard.dispatch();
-            backend_guard.render_space(state);
+            let configs = renderer_for_timer
+                .blocking_lock()
+                .get_screen_configs()
+                .to_vec();
+            backend_guard.render_space(state, &configs);
             TimeoutAction::ToDuration(Duration::from_millis(16)) // ~60fps
         })?;
     }

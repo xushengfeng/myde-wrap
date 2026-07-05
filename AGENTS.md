@@ -87,59 +87,14 @@ cargo clippy
 }
 ```
 
-#### 截取矩形区域
-
-```json
-{
-    "type": "CaptureRects",
-    "rects": [
-        { "x": 0, "y": 0, "width": 100, "height": 100 },
-        { "x": 200, "y": 200, "width": 150, "height": 150 }
-    ]
-}
-```
-
-#### 变换矩形
-
-**变换顺序**: 先缩放，后平移
-
-**缩放原点**: 矩形左上角 `(rect.x, rect.y)`
-
-**变换公式**:
-
-```
-final_x = rect.x * scale_x + translate_x
-final_y = rect.y * scale_y + translate_y
-final_width = rect.width * scale_x
-final_height = rect.height * scale_y
-```
-
-**参数说明**:
-
-- `scale_x`: X 轴缩放因子（1.0 = 不缩放，2.0 = 放大2倍，0.5 = 缩小一半）
-- `scale_y`: Y 轴缩放因子（1.0 = 不缩放，2.0 = 放大2倍，0.5 = 缩小一半）
-- `translate_x`: X 轴平移量（像素，正值向右）
-- `translate_y`: Y 轴平移量（像素，正值向下）
-
-**示例**:
-
-```json
-{
-    "type": "TransformRects",
-    "transforms": [{ "scale_x": 1.5, "scale_y": 1.5, "translate_x": 10.0, "translate_y": 20.0 }]
-}
-```
-
-上述示例表示：以矩形左上角为原点放大1.5倍，然后向右移动10像素，向下移动20像素。
-
-#### 渲染到屏幕
+#### 截取矩形区域并渲染
 
 ```json
 {
     "type": "RenderToScreen",
     "screen_index": 0,
-    "rects": [{ "x": 0, "y": 0, "width": 100, "height": 100 }],
-    "transforms": [{ "scale_x": 1.0, "scale_y": 1.0, "translate_x": 0.0, "translate_y": 0.0 }]
+    "rects": [{ "x": 0, "y": 0, "width": 800, "height": 600 }],
+    "transforms": [{ "rotation": 15.0 }]
 }
 ```
 
@@ -177,23 +132,6 @@ final_height = rect.height * scale_y
     "type": "WindowSizeSet",
     "width": 1920,
     "height": 1080
-}
-```
-
-#### 矩形已截取
-
-```json
-{
-    "type": "RectsCaptured",
-    "rects": [...]
-}
-```
-
-#### 矩形已变换
-
-```json
-{
-    "type": "RectsTransformed"
 }
 ```
 

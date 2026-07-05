@@ -190,7 +190,7 @@ impl RenderBackend for WinitBackend {
         }
     }
 
-    fn render_space(&mut self, _state: &mut App) {
+    fn render_space(&mut self, _state: &mut App, _configs: &[crate::renderer::ScreenConfig]) {
         // Winit backend handles rendering through its own event loop (WinitEvent::Redraw)
         // so this is a no-op here.
     }

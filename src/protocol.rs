@@ -32,24 +32,13 @@ pub struct Rect {
 ///   - scale_x=0.5, scale_y=0.5, translate_x=200: 矩形缩小一半，然后向右移动200像素
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transform {
-    /// X 轴缩放因子（1.0 = 不缩放，2.0 = 放大2倍，0.5 = 缩小一半）
-    pub scale_x: f64,
-    /// Y 轴缩放因子（1.0 = 不缩放，2.0 = 放大2倍，0.5 = 缩小一半）
-    pub scale_y: f64,
-    /// X 轴平移量（像素，正值向右）
-    pub translate_x: f64,
-    /// Y 轴平移量（像素，正值向下）
-    pub translate_y: f64,
+    /// 旋转/倾斜角度（度）
+    pub rotation: f64,
 }
 
 impl Default for Transform {
     fn default() -> Self {
-        Self {
-            scale_x: 1.0,
-            scale_y: 1.0,
-            translate_x: 0.0,
-            translate_y: 0.0,
-        }
+        Self { rotation: 0.0 }
     }
 }
 
