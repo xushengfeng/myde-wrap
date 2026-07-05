@@ -26,7 +26,6 @@ use tracing::{error, info};
 use crate::backend::RenderBackend;
 use crate::compositor::Compositor;
 use crate::drm::DrmBackend;
-use crate::protocol::ClientMessage;
 use crate::renderer::Renderer as MyRenderer;
 use crate::socket::SocketServer;
 use crate::wayland::App;
@@ -150,81 +149,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 克隆socket_server以在事件循环中使用
     let socket_server_clone = socket_server.clone();
-    let backend_clone = backend.clone();
+    
 
-    // 创建一个channel来传递socket连接
-    let (tx, rx) = smithay::reexports::calloop::channel::channel();
-
-    // 在单独的线程中接受socket连接
-    std::thread::spawn(move || loop {
-        if let Some(stream) = socket_server_clone.accept() {
-            let _ = tx.send(stream);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    });
-
-    // 在事件循环中处理socket消息
-    loop_handle.insert_source(rx, move |event, _, state| {
-        match event {
-            smithay::reexports::calloop::channel::Event::Msg(mut stream) => {
-                info!("收到新的socket连接");
-
-                // 读取消息
-                match socket::read_message(&mut stream) {
-                    Ok(msg) => {
-                        info!("收到消息: {:?}", msg);
-
-                        // 处理消息
-                        let response = tokio::runtime::Runtime::new()
-                            .unwrap()
-                            .block_on(compositor.handle_message(msg.clone()));
-
-                        // 发送响应
-                        if let Err(e) = socket::write_message(&mut stream, &response) {
-                            error!("发送响应失败: {}", e);
-                        }
-
-                        // 处理渲染
-                        match msg {
-                            ClientMessage::RenderToScreen {
-                                screen_index,
-                                rects,
-                                transforms,
-                            } => {
-                                // 设置自定义配置标志
-                                state.has_custom_config = true;
-
-                                // 处理渲染到屏幕
-                                let mut backend_guard = backend_clone.blocking_lock();
-                                for (i, rect) in rects.iter().enumerate() {
-                                    let transform = transforms.get(i).cloned().unwrap_or_default();
-                                    backend_guard.render_rect(
-                                        screen_index,
-                                        rect.x,
-                                        rect.y,
-                                        rect.width,
-                                        rect.height,
-                                        &transform,
-                                    );
+    // 在单独的线程中接受和处理socket连接，完全不阻塞主事件循环
+    std::thread::spawn(move || {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        loop {
+            if let Some(mut stream) = socket_server_clone.accept() {
+                let compositor = compositor.clone();
+                let rt_clone = rt.clone();
+                // 为每个连接单独分配一个线程，长连接完全不干扰主循环
+                std::thread::spawn(move || {
+                    info!("收到新的socket连接");
+                    // 这里不用设置太短的timeout，因为它在独立线程中，不会阻塞其他渲染逻辑
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
+                    loop {
+                        match socket::read_message(&mut stream) {
+                            Ok(msg) => {
+                                info!("收到消息: {:?}", msg);
+                                let response = rt_clone.block_on(compositor.handle_message(msg));
+                                if let Err(e) = socket::write_message(&mut stream, &response) {
+                                    error!("发送响应失败: {}", e);
+                                    break;
                                 }
                             }
-                            ClientMessage::SetWindowSize { width, height } => {
-                                // 处理窗口大小设置
-                                info!("设置窗口大小: {}x{}", width, height);
+                            Err(e) => {
+                                // Socket可能正常断开或超时
+                                tracing::debug!("Socket连接断开或超时: {}", e);
+                                break;
                             }
-                            _ => {}
                         }
                     }
-                    Err(e) => {
-                        error!("读取消息失败: {}", e);
-                    }
-                }
+                });
             }
-            smithay::reexports::calloop::channel::Event::Closed => {
-                error!("Socket连接关闭");
-            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-    })?;
+    });
 
     // For DRM backend, add a timer to periodically render the space
     let backend_for_render = backend.clone();
@@ -255,17 +215,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // 获取渲染器配置
-        let renderer = renderer_clone.blocking_lock();
+        
         let backend_guard = backend_for_default.blocking_lock();
         let backend_output_count = backend_guard.get_output_count();
 
         // 为每个屏幕设置默认全屏配置
+        let mut renderer_guard = renderer_clone.blocking_lock();
         for screen_index in 0..backend_output_count {
-            let config = renderer.get_default_fullscreen_config(screen_index);
+            let config = renderer_guard.get_default_fullscreen_config(screen_index);
             info!(
                 "设置默认全屏配置: 屏幕 {}, 矩形 {:?}, 变换 {:?}",
                 screen_index, config.rects, config.transforms
             );
+            // SAVE IT into the renderer so that DRM backend can actually use it
+            let _ = renderer_guard.render_to_screen(screen_index, config.rects.clone(), config.transforms.clone());
         }
     });
 

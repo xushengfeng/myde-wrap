@@ -42,6 +42,88 @@ struct DrmOutputData {
     smithay_output: Output,
 }
 
+
+
+pub enum MyElement {
+    Wayland(WaylandSurfaceRenderElement<GlesRenderer>),
+    Custom(crate::custom_element::CustomRotatedElement),
+}
+
+impl smithay::backend::renderer::element::Element for MyElement {
+    fn id(&self) -> &smithay::backend::renderer::element::Id {
+        match self {
+            MyElement::Wayland(e) => e.id(),
+            MyElement::Custom(e) => e.id(),
+        }
+    }
+    fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+        match self {
+            MyElement::Wayland(e) => e.current_commit(),
+            MyElement::Custom(e) => e.current_commit(),
+        }
+    }
+    fn src(&self) -> smithay::utils::Rectangle<f64, smithay::utils::Buffer> {
+        match self {
+            MyElement::Wayland(e) => e.src(),
+            MyElement::Custom(e) => e.src(),
+        }
+    }
+    fn transform(&self) -> smithay::utils::Transform {
+        match self {
+            MyElement::Wayland(e) => e.transform(),
+            MyElement::Custom(e) => e.transform(),
+        }
+    }
+    fn geometry(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+        match self {
+            MyElement::Wayland(e) => e.geometry(scale),
+            MyElement::Custom(e) => e.geometry(scale),
+        }
+    }
+    fn damage_since(&self, scale: smithay::utils::Scale<f64>, commit: Option<smithay::backend::renderer::utils::CommitCounter>) -> smithay::backend::renderer::utils::DamageSet<i32, smithay::utils::Physical> {
+        match self {
+            MyElement::Wayland(e) => e.damage_since(scale, commit),
+            MyElement::Custom(e) => e.damage_since(scale, commit),
+        }
+    }
+    fn opaque_regions(&self, scale: smithay::utils::Scale<f64>) -> smithay::backend::renderer::utils::OpaqueRegions<i32, smithay::utils::Physical> {
+        match self {
+            MyElement::Wayland(e) => e.opaque_regions(scale).to_vec().into_iter().collect(),
+            MyElement::Custom(_) => smithay::backend::renderer::utils::OpaqueRegions::default(),
+        }
+    }
+    fn alpha(&self) -> f32 {
+        match self {
+            MyElement::Wayland(e) => e.alpha(),
+            MyElement::Custom(e) => e.alpha(),
+        }
+    }
+    fn kind(&self) -> smithay::backend::renderer::element::Kind {
+        match self {
+            MyElement::Wayland(e) => e.kind(),
+            MyElement::Custom(e) => e.kind(),
+        }
+    }
+}
+
+impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for MyElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+        dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+        damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+        opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        match self {
+            MyElement::Wayland(e) => e.draw(frame, src, dst, damage, opaque_regions),
+            MyElement::Custom(e) => e.draw(frame, src, dst, damage, opaque_regions),
+        }
+    }
+}
+
+
+
 pub struct DrmBackend {
     width: u32,
     height: u32,
@@ -65,6 +147,7 @@ pub struct DrmBackend {
     needs_vblank: bool,
     pub rotate_shader: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     pub offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture>,
+    offscreen_id: smithay::backend::renderer::element::Id,
 }
 
 // SAFETY: GlesRenderer contains raw pointers that are not Send, but it's safe to send
@@ -91,6 +174,7 @@ impl DrmBackend {
             needs_vblank: false,
             rotate_shader: None,
             offscreen_texture: None,
+            offscreen_id: smithay::backend::renderer::element::Id::new(),
         }
     }
 }
@@ -494,7 +578,8 @@ void main() {
             .collect();
 
         // If we have an offscreen texture and a rotate shader, render to it first
-        let mut final_elements: Vec<crate::custom_element::CustomRotatedElement> = Vec::new();
+        let mut final_elements: Vec<MyElement> = Vec::new();
+        let mut offscreen_success = false;
 
         if let (Some(tex), Some(shader)) =
             (self.offscreen_texture.as_mut(), self.rotate_shader.as_ref())
@@ -530,8 +615,9 @@ void main() {
                 }
             }
 
-            final_elements.push(crate::custom_element::CustomRotatedElement {
-                id: smithay::backend::renderer::element::Id::new(),
+            offscreen_success = true;
+            final_elements.push(MyElement::Custom(crate::custom_element::CustomRotatedElement {
+                id: self.offscreen_id.clone(),
                 texture: tex.clone(),
                 src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
                     self.width as f64,
@@ -543,11 +629,17 @@ void main() {
                 ))),
                 rotation,
                 shader: shader.clone(),
-            });
+            }));
+        }
+
+        if !offscreen_success {
+            for element in elements {
+                final_elements.push(MyElement::Wayland(element));
+            }
         }
 
         // Render frame
-        match compositor.render_frame::<_, crate::custom_element::CustomRotatedElement>(
+        match compositor.render_frame::<_, MyElement>(
             renderer,
             &final_elements,
             [0.1, 0.1, 0.1, 1.0],

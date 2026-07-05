@@ -42,7 +42,6 @@ pub struct App {
     pub seat: Seat<Self>,
 
     // 自定义配置状态
-    pub has_custom_config: bool,
 }
 
 impl App {
@@ -103,7 +102,6 @@ impl App {
             data_device_state,
             popups,
             seat,
-            has_custom_config: false,
         }
     }
 

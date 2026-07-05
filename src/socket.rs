@@ -62,7 +62,14 @@ pub fn read_message(stream: &mut UnixStream) -> anyhow::Result<ClientMessage> {
     let mut msg_buf = vec![0u8; len];
     stream.read_exact(&mut msg_buf)?;
 
-    let msg: ClientMessage = serde_json::from_slice(&msg_buf)?;
+    let msg: ClientMessage = match serde_json::from_slice(&msg_buf) {
+        Ok(msg) => msg,
+        Err(e) => {
+            let raw_str = String::from_utf8_lossy(&msg_buf);
+            tracing::error!("数据解析错误: {}. 原始数据: {}", e, raw_str);
+            return Err(anyhow::anyhow!("数据解析错误: {}", e));
+        }
+    };
     Ok(msg)
 }
 
