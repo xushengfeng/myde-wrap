@@ -72,17 +72,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and initialize the selected backend
     let mut backend: Box<dyn RenderBackend> = match args.backend.as_str() {
         "drm" => {
-            info!("使用 DRM 后端");
+            info!("using DRM backend");
             Box::new(DrmBackend::new())
         }
         _ => {
-            info!("使用 winit 后端");
+            info!("using winit backend");
             Box::new(WinitBackend::new())
         }
     };
 
     backend.init(&mut event_loop, &mut state)?;
-    info!("后端初始化完成: {}", backend.name());
+    info!("backend inited: {}", backend.name());
 
     // Set WAYLAND_DISPLAY to our socket name, so child processes connect to myde-wrap
     // rather than the host compositor
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[]
     };
 
-    info!("启动程序: {} {:?}", program, program_args);
+    info!("run program: {} {:?}", program, program_args);
 
     // 继承所有父进程环境变量
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
@@ -129,14 +129,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .envs(envs)
         .spawn()?;
 
-    info!("程序已启动, PID: {}", child.id());
+    info!("program started, PID: {}", child.id());
 
     // Spawn a task to handle child process exit
     std::thread::spawn(move || {
         let status = child.wait();
         match status {
-            Ok(status) => info!("程序退出, 状态: {}", status),
-            Err(e) => error!("等待程序失败: {}", e),
+            Ok(status) => info!("program exited, status: {}", status),
+            Err(e) => error!("failed to wait for program: {}", e),
         }
     });
 
@@ -149,7 +149,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 克隆socket_server以在事件循环中使用
     let socket_server_clone = socket_server.clone();
-    
 
     // 在单独的线程中接受和处理socket连接，完全不阻塞主事件循环
     std::thread::spawn(move || {
@@ -160,22 +159,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rt_clone = rt.clone();
                 // 为每个连接单独分配一个线程，长连接完全不干扰主循环
                 std::thread::spawn(move || {
-                    info!("收到新的socket连接");
+                    info!("received new socket connection");
                     // 这里不用设置太短的timeout，因为它在独立线程中，不会阻塞其他渲染逻辑
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(5000)));
                     loop {
                         match socket::read_message(&mut stream) {
                             Ok(msg) => {
-                                info!("收到消息: {:?}", msg);
+                                info!("received message: {:?}", msg);
                                 let response = rt_clone.block_on(compositor.handle_message(msg));
                                 if let Err(e) = socket::write_message(&mut stream, &response) {
-                                    error!("发送响应失败: {}", e);
+                                    error!("failed to send response: {}", e);
                                     break;
                                 }
                             }
                             Err(e) => {
                                 // Socket可能正常断开或超时
-                                tracing::debug!("Socket连接断开或超时: {}", e);
+                                tracing::debug!("Socket connection closed or timed out: {}", e);
                                 break;
                             }
                         }
@@ -215,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // 获取渲染器配置
-        
+
         let backend_guard = backend_for_default.blocking_lock();
         let backend_output_count = backend_guard.get_output_count();
 
@@ -224,11 +223,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for screen_index in 0..backend_output_count {
             let config = renderer_guard.get_default_fullscreen_config(screen_index);
             info!(
-                "设置默认全屏配置: 屏幕 {}, 矩形 {:?}, 变换 {:?}",
+                "setting default fullscreen config: screen {}, rects {:?}, transforms {:?}",
                 screen_index, config.rects, config.transforms
             );
             // SAVE IT into the renderer so that DRM backend can actually use it
-            let _ = renderer_guard.render_to_screen(screen_index, config.rects.clone(), config.transforms.clone());
+            let _ = renderer_guard.render_to_screen(
+                screen_index,
+                config.rects.clone(),
+                config.transforms.clone(),
+            );
         }
     });
 

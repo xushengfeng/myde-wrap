@@ -26,7 +26,7 @@ impl Renderer {
         let window_height = default_screen.height;
 
         info!(
-            "默认显示器: {} ({}x{})",
+            "default screen: {} ({}x{})",
             default_screen.name, window_width, window_height
         );
 
@@ -90,7 +90,7 @@ impl Renderer {
         }
 
         // 如果无法检测，返回默认屏幕
-        info!("无法检测屏幕信息，使用默认配置");
+        info!("failed to detect screen info, using default configuration");
         vec![ScreenInfo {
             name: "Screen-0".to_string(),
             width: 1920,

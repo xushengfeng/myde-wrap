@@ -42,8 +42,6 @@ struct DrmOutputData {
     smithay_output: Output,
 }
 
-
-
 pub enum MyElement {
     Wayland(WaylandSurfaceRenderElement<GlesRenderer>),
     Custom(crate::custom_element::CustomRotatedElement),
@@ -74,19 +72,29 @@ impl smithay::backend::renderer::element::Element for MyElement {
             MyElement::Custom(e) => e.transform(),
         }
     }
-    fn geometry(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+    fn geometry(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
         match self {
             MyElement::Wayland(e) => e.geometry(scale),
             MyElement::Custom(e) => e.geometry(scale),
         }
     }
-    fn damage_since(&self, scale: smithay::utils::Scale<f64>, commit: Option<smithay::backend::renderer::utils::CommitCounter>) -> smithay::backend::renderer::utils::DamageSet<i32, smithay::utils::Physical> {
+    fn damage_since(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+        commit: Option<smithay::backend::renderer::utils::CommitCounter>,
+    ) -> smithay::backend::renderer::utils::DamageSet<i32, smithay::utils::Physical> {
         match self {
             MyElement::Wayland(e) => e.damage_since(scale, commit),
             MyElement::Custom(e) => e.damage_since(scale, commit),
         }
     }
-    fn opaque_regions(&self, scale: smithay::utils::Scale<f64>) -> smithay::backend::renderer::utils::OpaqueRegions<i32, smithay::utils::Physical> {
+    fn opaque_regions(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+    ) -> smithay::backend::renderer::utils::OpaqueRegions<i32, smithay::utils::Physical> {
         match self {
             MyElement::Wayland(e) => e.opaque_regions(scale).to_vec().into_iter().collect(),
             MyElement::Custom(_) => smithay::backend::renderer::utils::OpaqueRegions::default(),
@@ -121,8 +129,6 @@ impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for MyElem
         }
     }
 }
-
-
 
 pub struct DrmBackend {
     width: u32,
@@ -338,7 +344,7 @@ uniform float tint;
 void main() {
     float c = cos(custom_rotation);
     float s = sin(custom_rotation);
-    
+
     // Rotate around (0.0, 0.0) which corresponds to rect.xy (top-left of the screen)
     vec2 p = v_coords;
     vec2 rp = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
@@ -497,24 +503,6 @@ void main() {
 
         self.frame_count += 1;
 
-        // Debug: Check space elements
-        let element_count = state.space.elements().count();
-        if self.frame_count <= 10 || element_count == 0 && self.frame_count % 60 == 0 {
-            info!(
-                "Frame {}: space has {} elements",
-                self.frame_count, element_count
-            );
-            // List all windows
-            for (i, window) in state.space.elements().enumerate() {
-                let surface = window.toplevel().unwrap().wl_surface();
-                let geo = state.space.element_geometry(window);
-                info!("  Window {}: surface {:?}, geometry {:?}", i, surface, geo);
-            }
-            // Also check toplevel_surfaces from xdg_shell_state
-            let toplevel_count = state.xdg_shell_state.toplevel_surfaces().len();
-            info!("  xdg_shell_state has {} toplevel surfaces", toplevel_count);
-        }
-
         let output_data = &self.outputs[0];
         let screen_index = 0; // For now we only render the first DRM output
 
@@ -616,20 +604,22 @@ void main() {
             }
 
             offscreen_success = true;
-            final_elements.push(MyElement::Custom(crate::custom_element::CustomRotatedElement {
-                id: self.offscreen_id.clone(),
-                texture: tex.clone(),
-                src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
-                    self.width as f64,
-                    self.height as f64,
-                ))),
-                dst: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
-                    self.width as i32,
-                    self.height as i32,
-                ))),
-                rotation,
-                shader: shader.clone(),
-            }));
+            final_elements.push(MyElement::Custom(
+                crate::custom_element::CustomRotatedElement {
+                    id: self.offscreen_id.clone(),
+                    texture: tex.clone(),
+                    src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                        self.width as f64,
+                        self.height as f64,
+                    ))),
+                    dst: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                        self.width as i32,
+                        self.height as i32,
+                    ))),
+                    rotation,
+                    shader: shader.clone(),
+                },
+            ));
         }
 
         if !offscreen_success {
@@ -646,16 +636,7 @@ void main() {
             FrameFlags::DEFAULT,
         ) {
             Ok(render_frame_result) => {
-                if self.frame_count <= 10 {
-                    info!(
-                        "Frame {}: render_frame returned is_empty={}",
-                        self.frame_count, render_frame_result.is_empty
-                    );
-                }
                 if !render_frame_result.is_empty {
-                    if self.frame_count <= 10 || self.frame_count % 60 == 0 {
-                        info!("Frame {}: queuing frame", self.frame_count);
-                    }
                     // Queue the frame for display
                     if let Err(e) = compositor.queue_frame(()) {
                         error!(
@@ -665,10 +646,6 @@ void main() {
                         return;
                     }
                     self.needs_vblank = true;
-
-                    if self.frame_count <= 10 {
-                        info!("Frame {}: Frame queued successfully", self.frame_count);
-                    }
                 }
 
                 // Always send frame events to Wayland clients so they are not blocked
