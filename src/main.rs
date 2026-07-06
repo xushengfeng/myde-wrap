@@ -71,13 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create and initialize the selected backend
     let mut backend: Box<dyn RenderBackend> = match args.backend.as_str() {
-        "drm" => {
-            info!("using DRM backend");
-            Box::new(DrmBackend::new())
-        }
-        _ => {
+        "winit" => {
             info!("using winit backend");
             Box::new(WinitBackend::new())
+        }
+        _ => {
+            info!("using DRM backend");
+            Box::new(DrmBackend::new())
         }
     };
 
