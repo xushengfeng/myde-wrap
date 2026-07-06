@@ -67,18 +67,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<App> = Display::new()?;
     let mut state = App::new(&mut event_loop, display);
 
-    let is_drm = args.backend.as_str() == "drm";
+    let is_drm = args.backend.as_str() != "drm";
 
     // Create and initialize the selected backend
-    let mut backend: Box<dyn RenderBackend> = match args.backend.as_str() {
-        "winit" => {
-            info!("using winit backend");
-            Box::new(WinitBackend::new())
-        }
-        _ => {
-            info!("using DRM backend");
-            Box::new(DrmBackend::new())
-        }
+    let mut backend: Box<dyn RenderBackend> = if is_drm {
+        info!("using DRM backend");
+        Box::new(DrmBackend::new())
+    } else {
+        info!("using winit backend");
+        Box::new(WinitBackend::new())
     };
 
     backend.init(&mut event_loop, &mut state)?;
