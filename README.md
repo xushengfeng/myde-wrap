@@ -2,6 +2,8 @@
 
 一个轻量级的 Rust Wayland 桌面合成器，专注于渲染单个应用，并通过 Unix Socket 提供控制裁取缩放平移并指定到屏幕的能力。
 
+主要用于[myde](https://github.com/xushengfeng/myde)显示
+
 ## 功能特性
 
 单应用渲染: 专注于渲染一个应用，类似cage的kiosk模式

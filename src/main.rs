@@ -123,6 +123,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !envs.iter().any(|(k, _)| k == "XDG_SESSION_TYPE") {
         envs.push(("XDG_SESSION_TYPE".to_string(), "wayland".to_string()));
     }
+    // 让myde以桌面运行
+    envs.push(("runAsDesktop".to_string(), "true".to_string()));
 
     let mut child = Command::new(program)
         .args(program_args)
