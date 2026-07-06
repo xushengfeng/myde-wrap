@@ -39,13 +39,7 @@ cargo build --release
 ### 运行
 
 ```bash
-# 使用 winit 后端（窗口显示）- 默认
-cargo run -- --backend winit /usr/bin/weston-terminal
-
-# 使用 DRM 后端（物理屏幕渲染）
-sudo cargo run -- --backend drm /usr/bin/weston-terminal
-
-# 简写（默认 winit 后端）
+# 简写（默认 drm 后端）
 cargo run -- /usr/bin/weston-terminal
 ```
 
@@ -55,7 +49,7 @@ cargo run -- /usr/bin/weston-terminal
 myde-wrap [OPTIONS] <COMMAND> [ARGS]...
 
 OPTIONS:
-    -b, --backend <BACKEND>    渲染后端: winit 或 drm [默认: winit]
+    -b, --backend <BACKEND>    渲染后端: winit 或 drm [默认: drm]
     -h, --help                 打印帮助信息
     -V, --version              打印版本信息
 
