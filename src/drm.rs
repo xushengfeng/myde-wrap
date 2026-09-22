@@ -548,17 +548,25 @@ void main() {
             .smithay_output
             .change_current_state(None, Some(transform), None, None);
 
+        let scale = smithay::utils::Scale::from((scale_x, scale_y));
+
         // Collect render elements from all windows in the space
         let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
             .space
             .elements()
             .flat_map(|window| {
                 let surface = window.toplevel().unwrap().wl_surface().clone();
+                // 与 smithay 的 Space 渲染保持一致：窗口原点对应 xdg_window_geometry 的
+                // 原点，而 surface tree 的原点相对窗口原点偏移 geometry().loc
+                //（CSD 阴影/边距）。渲染 surface tree 时必须减去该偏移，
+                // 否则内容会整体向右下偏移。
+                let geometry_offset: smithay::utils::Point<i32, smithay::utils::Physical> =
+                    window.geometry().loc.to_physical_precise_round(scale);
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    (loc_x, loc_y),
-                    smithay::utils::Scale::from((scale_x, scale_y)),
+                    (loc_x - geometry_offset.x, loc_y - geometry_offset.y),
+                    scale,
                     1.0,
                     smithay::backend::renderer::element::Kind::Unspecified,
                 )
@@ -596,7 +604,9 @@ void main() {
                     let _ = element.draw(
                         &mut frame,
                         element.src(),
-                        element.geometry(smithay::utils::Scale::from(1.0)),
+                        // 必须使用创建元素时的 scale，geometry() 会按传入的 scale
+                        // 计算目标尺寸，传 1.0 会导致非 1:1 截取时位置/尺寸错误
+                        element.geometry(scale),
                         &damage,
                         &[],
                     );
