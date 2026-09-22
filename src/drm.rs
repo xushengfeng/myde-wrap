@@ -30,22 +30,60 @@ use crate::backend::RenderBackend;
 use crate::protocol::{Rect, ScreenInfo, Transform};
 use crate::wayland::App;
 
-/// 默认画布矩形：SetWindowSize 声明的画布与应用窗口实际尺寸取大，
-/// 保证虚拟画布不裁切应用。
-/// 画布坐标系原点为窗口内容（xdg window geometry）左上角。
-fn default_canvas_rect(state: &App, canvas_size: Option<(u32, u32)>) -> Rect {
-    let (mut width, mut height) = canvas_size.unwrap_or((0, 0));
+/// 计算画布相关矩形（内容坐标系：原点为窗口内容（xdg window geometry）左上角，
+/// 即协议 rect 的坐标系）。返回 (离屏画布矩形, 应用内容范围)：
+///
+/// - 应用内容范围 = 各窗口 surface tree 包围盒的并集（含阴影/悬出部分），
+///   与应用大小实时同步；默认显示区域即此范围，保证画布不裁切应用；
+/// - 离屏画布矩形 = 应用内容范围 ∪ SetWindowSize 声明的 (0, 0, w, h)，
+///   仅作为 rect 截取的坐标空间（可突破物理屏幕）。
+fn canvas_rects(state: &App, canvas_size: Option<(u32, u32)>) -> (Rect, Rect) {
+    let mut x0 = 0i32;
+    let mut y0 = 0i32;
+    let mut x1 = 0i32;
+    let mut y1 = 0i32;
+    let mut has_window = false;
+
     for window in state.space.elements() {
         let geo = window.geometry();
-        width = width.max(geo.size.w.max(0) as u32);
-        height = height.max(geo.size.h.max(0) as u32);
+        let bbox = window.bbox();
+        // 内容坐标 = surface tree 坐标 - geo.loc
+        let wx0 = bbox.loc.x - geo.loc.x;
+        let wy0 = bbox.loc.y - geo.loc.y;
+        let wx1 = wx0 + bbox.size.w;
+        let wy1 = wy0 + bbox.size.h;
+        if has_window {
+            x0 = x0.min(wx0);
+            y0 = y0.min(wy0);
+            x1 = x1.max(wx1);
+            y1 = y1.max(wy1);
+        } else {
+            (x0, y0, x1, y1) = (wx0, wy0, wx1, wy1);
+            has_window = true;
+        }
     }
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
+
+    let app_rect = Rect {
+        x: x0,
+        y: y0,
+        width: (x1 - x0).max(0) as u32,
+        height: (y1 - y0).max(0) as u32,
+    };
+
+    // 离屏画布 = 应用内容范围 ∪ 声明画布 (0, 0, w, h)
+    let (decl_w, decl_h) = canvas_size.unwrap_or((0, 0));
+    let ox0 = x0.min(0);
+    let oy0 = y0.min(0);
+    let ox1 = x1.max(decl_w as i32);
+    let oy1 = y1.max(decl_h as i32);
+    let offscreen_rect = Rect {
+        x: ox0,
+        y: oy0,
+        width: (ox1 - ox0).max(0) as u32,
+        height: (oy1 - oy0).max(0) as u32,
+    };
+
+    (offscreen_rect, app_rect)
 }
 
 struct DrmOutputData {
@@ -357,12 +395,12 @@ uniform sampler2D tex;
 uniform float alpha;
 varying vec2 v_coords;
 
-// 截取区域（画布像素）：左上角 (x, y)、长宽 (w, h)
+// 截取区域（内容坐标）：左上角 (x, y)、长宽 (w, h)
 uniform vec4 u_region;
 // 截取区域绕锚点 (x, y) 的旋转角（弧度）
 uniform float u_rotation;
-// 画布尺寸（像素）
-uniform vec2 u_canvas;
+// 画布离屏纹理矩形（内容坐标）：原点 (x, y)、尺寸 (w, h)
+uniform vec4 u_offscreen;
 
 #if defined(DEBUG_FLAGS)
 uniform float tint;
@@ -373,14 +411,15 @@ void main() {
     // 屏幕坐标 -> 截取区域坐标（拉伸填充，隐式缩放）
     vec2 region = vec2(v_coords.x * u_region.z, v_coords.y * u_region.w);
 
-    // 区域以 (x, y) 为锚点、绕锚点旋转，采样画布：
+    // 区域以 (x, y) 为锚点、绕锚点旋转，采样画布内容坐标：
     // 等价于把画布绕 (x, y) 旋转 -u_rotation 后截取 (0, 0, w, h) 拉伸上屏，
     // 旋转作用在截取阶段，直角得以保持
     float c = cos(u_rotation);
     float s = sin(u_rotation);
-    vec2 canvas = u_region.xy + vec2(region.x * c - region.y * s, region.x * s + region.y * c);
+    vec2 content = u_region.xy + vec2(region.x * c - region.y * s, region.x * s + region.y * c);
 
-    vec2 uv = canvas / u_canvas;
+    // 内容坐标 -> 离屏纹理坐标；范围之外（应用绘制范围之外）为透明
+    vec2 uv = (content - u_offscreen.xy) / u_offscreen.zw;
 
     vec4 color;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -413,8 +452,8 @@ void main() {
                     smithay::backend::renderer::gles::UniformType::_1f,
                 ),
                 smithay::backend::renderer::gles::UniformName::new(
-                    "u_canvas",
-                    smithay::backend::renderer::gles::UniformType::_2f,
+                    "u_offscreen",
+                    smithay::backend::renderer::gles::UniformType::_4f,
                 ),
             ],
         )?;
@@ -546,9 +585,10 @@ void main() {
     ) {
         self.frame_count += 1;
 
-        // 画布 = max(SetWindowSize 声明, 应用窗口内容尺寸)，坐标原点为窗口内容左上角
-        let canvas = default_canvas_rect(state, canvas_size);
-        let canvas_valid = canvas.width > 0 && canvas.height > 0;
+        // 内容坐标系原点 = 窗口内容（xdg window geometry）左上角（协议 rect 坐标系）。
+        // offscreen_rect 为离屏画布矩形，app_rect 为应用内容范围（默认显示区域）
+        let (offscreen_rect, app_rect) = canvas_rects(state, canvas_size);
+        let canvas_valid = offscreen_rect.width > 0 && offscreen_rect.height > 0;
 
         let renderer = match self.renderer.as_mut() {
             Some(r) => r,
@@ -569,7 +609,10 @@ void main() {
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    (-geometry_loc.x, -geometry_loc.y),
+                    (
+                        -geometry_loc.x - offscreen_rect.x,
+                        -geometry_loc.y - offscreen_rect.y,
+                    ),
                     smithay::utils::Scale::from(1.0),
                     1.0,
                     smithay::backend::renderer::element::Kind::Unspecified,
@@ -583,19 +626,22 @@ void main() {
 
         if canvas_valid && self.rotate_shader.is_some() {
             let need_recreate = match (&self.offscreen_texture, self.offscreen_size) {
-                (Some(_), Some(sz)) => sz != (canvas.width, canvas.height),
+                (Some(_), Some(sz)) => sz != (offscreen_rect.width, offscreen_rect.height),
                 _ => true,
             };
             if need_recreate {
                 self.offscreen_texture = None;
                 self.offscreen_size = None;
-                let size = smithay::utils::Size::from((canvas.width as i32, canvas.height as i32));
+                let size = smithay::utils::Size::from((
+                    offscreen_rect.width as i32,
+                    offscreen_rect.height as i32,
+                ));
                 use smithay::backend::renderer::Offscreen;
                 self.offscreen_texture = renderer
                     .create_buffer(smithay::backend::allocator::Fourcc::Argb8888, size)
                     .ok();
                 if self.offscreen_texture.is_some() {
-                    self.offscreen_size = Some((canvas.width, canvas.height));
+                    self.offscreen_size = Some((offscreen_rect.width, offscreen_rect.height));
                 }
             }
 
@@ -604,8 +650,10 @@ void main() {
             {
                 use smithay::backend::renderer::{Bind, Frame, Renderer};
                 {
-                    let size =
-                        smithay::utils::Size::from((canvas.width as i32, canvas.height as i32));
+                    let size = smithay::utils::Size::from((
+                        offscreen_rect.width as i32,
+                        offscreen_rect.height as i32,
+                    ));
                     let mut target = renderer.bind(tex).unwrap();
                     let mut frame = renderer
                         .render(&mut target, size, smithay::utils::Transform::Normal)
@@ -660,7 +708,7 @@ void main() {
                         (rect.clone(), rotation)
                     })
                     .collect(),
-                _ => vec![(canvas.clone(), 0.0)],
+                _ => vec![(app_rect.clone(), 0.0)],
             };
 
             let screen_size =
@@ -677,9 +725,10 @@ void main() {
                             id: smithay::backend::renderer::element::Id::new(),
                             texture: tex.clone(),
                             src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from(
-                                (canvas.width as f64, canvas.height as f64),
+                                (offscreen_rect.width as f64, offscreen_rect.height as f64),
                             )),
                             region: rect.clone(),
+                            offscreen: offscreen_rect.clone(),
                             rotation: *rotation,
                             dst: smithay::utils::Rectangle::from_size(screen_size),
                             shader: shader.clone(),

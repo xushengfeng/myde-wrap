@@ -71,7 +71,7 @@ pub enum ClientMessage {
     ///
     /// - `rects[i]` 与 `transforms[i]` 按下标配对（缺省 rotation = 0）
     /// - 每个区域以 (x, y) 为锚点旋转截取，转正后拉伸填充到 `screen_index` 屏幕
-    /// - `rects` 留空表示整个画布
+    /// - `rects` 留空表示应用内容范围（默认拉伸铺满，随应用大小同步）
     /// - 同一屏幕多个区域按数组顺序叠放，靠前的在下层
     RenderToScreen {
         screen_index: usize,
