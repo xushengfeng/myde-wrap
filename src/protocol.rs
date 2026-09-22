@@ -22,9 +22,6 @@ pub struct Rect {
 /// 等价于：把画布绕 (rect.x, rect.y) 旋转 -rotation 度后，
 /// 截取以锚点为左上角的 rect.width × rect.height 区域，拉伸铺满目标屏幕。
 ///
-/// `rects` 与 `transforms` 按下标配对：rects[i] 对应 transforms[i]（缺省 rotation = 0）。
-/// 同一屏幕配置多个区域时按数组顺序叠放，靠前的在下层。
-///
 /// 示例（rect = {x: 0, y: 0, width: 800, height: 600}）：
 ///   - rotation=0: 截取 (0, 0, 800, 600)，拉伸铺满屏幕
 ///   - rotation=15: 区域绕 (0, 0) 偏转 15° 截取（显示内容逆时针偏转），转正后拉伸铺满屏幕
@@ -67,16 +64,18 @@ pub enum ClientMessage {
     TransformRects {
         transforms: Vec<Transform>,
     },
-    /// 将画布截取区域渲染到屏幕
+    /// 将画布截取区域渲染到屏幕（一个屏幕一个截取区域）
     ///
-    /// - `rects[i]` 与 `transforms[i]` 按下标配对（缺省 rotation = 0）
-    /// - 每个区域以 (x, y) 为锚点旋转截取，转正后拉伸填充到 `screen_index` 屏幕
-    /// - `rects` 留空表示应用内容范围（默认拉伸铺满，随应用大小同步）
-    /// - 同一屏幕多个区域按数组顺序叠放，靠前的在下层
+    /// - `rect` 为截取区域（内容坐标），以 (x, y) 为锚点旋转 `transform.rotation`
+    ///   度截取，转正后拉伸填充到 `screen_index` 屏幕
+    /// - `rect` 缺省（null 或不传）表示应用内容范围（拉伸铺满）
+    /// - `transform` 缺省（null 或不传）表示不旋转
     RenderToScreen {
         screen_index: usize,
-        rects: Vec<Rect>,
-        transforms: Vec<Transform>,
+        #[serde(default)]
+        rect: Option<Rect>,
+        #[serde(default)]
+        transform: Option<Transform>,
     },
     GetScreens,
     SetInputEnabled {

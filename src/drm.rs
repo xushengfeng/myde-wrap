@@ -696,49 +696,40 @@ void main() {
 
             let config = configs.iter().find(|c| c.screen_index == index);
 
-            // rects[i] 与 transforms[i] 配对（缺省 rotation = 0）；
-            // rects 留空（或无配置）= 整个画布（默认行为）
-            let pairs: Vec<(Rect, f64)> = match config {
-                Some(c) if !c.rects.is_empty() => c
-                    .rects
-                    .iter()
-                    .enumerate()
-                    .map(|(i, rect)| {
-                        let rotation = c.transforms.get(i).map(|t| t.rotation).unwrap_or(0.0);
-                        (rect.clone(), rotation)
-                    })
-                    .collect(),
-                _ => vec![(app_rect.clone(), 0.0)],
-            };
+            // 一个屏幕一个截取区域：rect 缺省（或无配置）= 应用内容范围（默认行为），
+            // transform 缺省 = 不旋转
+            let rect = config
+                .and_then(|c| c.rect.as_ref())
+                .cloned()
+                .unwrap_or_else(|| app_rect.clone());
+            let rotation = config
+                .and_then(|c| c.transform.as_ref())
+                .map(|t| t.rotation)
+                .unwrap_or(0.0);
 
             let screen_size =
                 smithay::utils::Size::from((output_data.width as i32, output_data.height as i32));
             let mut final_elements: Vec<MyElement> = Vec::new();
 
             if let (Some(tex), Some(shader)) = (offscreen_texture.as_ref(), crop_shader.as_ref()) {
-                // 每个（截取区域, 旋转）对渲成一个旋转截取+拉伸填充元素。
-                // render_frame 绘制时 slice 首元素在最上层，倒序入栈实现
-                // “rects 靠前的在下层，靠后的在上层”。
-                for (rect, rotation) in pairs.iter().rev() {
-                    final_elements.push(MyElement::Custom(
-                        crate::custom_element::CropStretchElement {
-                            id: smithay::backend::renderer::element::Id::new(),
-                            texture: tex.clone(),
-                            src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from(
-                                (offscreen_rect.width as f64, offscreen_rect.height as f64),
-                            )),
-                            region: rect.clone(),
-                            offscreen: offscreen_rect.clone(),
-                            rotation: *rotation,
-                            dst: smithay::utils::Rectangle::from_size(screen_size),
-                            shader: shader.clone(),
-                        },
-                    ));
-                }
+                // 旋转截取 + 拉伸填充元素
+                final_elements.push(MyElement::Custom(
+                    crate::custom_element::CropStretchElement {
+                        id: smithay::backend::renderer::element::Id::new(),
+                        texture: tex.clone(),
+                        src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                            offscreen_rect.width as f64,
+                            offscreen_rect.height as f64,
+                        ))),
+                        region: rect.clone(),
+                        offscreen: offscreen_rect.clone(),
+                        rotation,
+                        dst: smithay::utils::Rectangle::from_size(screen_size),
+                        shader: shader.clone(),
+                    },
+                ));
             } else {
-                // 回退：离屏纹理不可用时按拉伸逻辑直接渲 surface tree
-                //（无旋转、仅首个区域）
-                let (rect, _) = &pairs[0];
+                // 回退：离屏纹理不可用时按拉伸逻辑直接渲 surface tree（无旋转）
                 let scale_x = output_data.width as f64 / (rect.width as f64).max(1.0);
                 let scale_y = output_data.height as f64 / (rect.height as f64).max(1.0);
                 let scale = smithay::utils::Scale::from((scale_x, scale_y));

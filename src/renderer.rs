@@ -14,8 +14,10 @@ pub struct Renderer {
 #[derive(Clone, Debug)]
 pub struct ScreenConfig {
     pub screen_index: usize,
-    pub rects: Vec<Rect>,
-    pub transforms: Vec<Transform>,
+    /// 截取区域（内容坐标）；None = 应用内容范围（拉伸铺满）
+    pub rect: Option<Rect>,
+    /// 截取变换；None = 不旋转
+    pub transform: Option<Transform>,
 }
 
 impl Renderer {
@@ -57,11 +59,14 @@ impl Renderer {
         self.transforms = transforms;
     }
 
+    /// 将画布截取区域渲染到屏幕（一个屏幕一个截取区域）
+    ///
+    /// `rect` 缺省 = 应用内容范围（拉伸铺满）；`transform` 缺省 = 不旋转
     pub fn render_to_screen(
         &mut self,
         screen_index: usize,
-        rects: Vec<Rect>,
-        transforms: Vec<Transform>,
+        rect: Option<Rect>,
+        transform: Option<Transform>,
     ) -> anyhow::Result<()> {
         if screen_index >= self.screens.len() {
             return Err(anyhow::anyhow!("Invalid screen index: {}", screen_index));
@@ -70,8 +75,8 @@ impl Renderer {
         // 保存屏幕配置
         let config = ScreenConfig {
             screen_index,
-            rects: rects.clone(),
-            transforms: transforms.clone(),
+            rect: rect.clone(),
+            transform: transform.clone(),
         };
 
         // 更新或添加屏幕配置
@@ -85,8 +90,8 @@ impl Renderer {
             self.screen_configs.push(config);
         }
 
-        self.captured_rects = rects;
-        self.transforms = transforms;
+        self.captured_rects = rect.into_iter().collect();
+        self.transforms = transform.into_iter().collect();
         Ok(())
     }
 
@@ -117,13 +122,12 @@ impl Renderer {
         &self.screen_configs
     }
 
-    // 获取默认的全屏配置：rects 留空表示"整个画布"（自动取
-    // max(SetWindowSize 声明尺寸, 应用窗口尺寸)），拉伸铺满屏幕
+    // 获取默认的全屏配置：rect 缺省 = 应用内容范围，拉伸铺满屏幕；不旋转
     pub fn get_default_fullscreen_config(&self, screen_index: usize) -> ScreenConfig {
         ScreenConfig {
             screen_index,
-            rects: Vec::new(),
-            transforms: vec![Transform { rotation: 0.0 }],
+            rect: None,
+            transform: None,
         }
     }
 

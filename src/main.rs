@@ -261,14 +261,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for screen_index in 0..backend_output_count {
             let config = renderer_guard.get_default_fullscreen_config(screen_index);
             info!(
-                "setting default fullscreen config: screen {}, rects {:?}, transforms {:?} (rects 留空 = 整个画布拉伸铺满)",
-                screen_index, config.rects, config.transforms
+                "setting default fullscreen config: screen {}, rect {:?}, transform {:?} (rect 缺省 = 应用内容范围拉伸铺满)",
+                screen_index, config.rect, config.transform
             );
             // SAVE IT into the renderer so that DRM backend can actually use it
             let _ = renderer_guard.render_to_screen(
                 screen_index,
-                config.rects.clone(),
-                config.transforms.clone(),
+                config.rect.clone(),
+                config.transform.clone(),
             );
         }
     });

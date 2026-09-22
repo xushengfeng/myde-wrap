@@ -31,9 +31,9 @@ impl Compositor {
             }
             ClientMessage::RenderToScreen {
                 screen_index,
-                rects,
-                transforms,
-            } => match renderer.render_to_screen(screen_index, rects, transforms) {
+                rect,
+                transform,
+            } => match renderer.render_to_screen(screen_index, rect, transform) {
                 Ok(()) => ServerResponse::RenderedToScreen { screen_index },
                 Err(e) => ServerResponse::Error {
                     message: e.to_string(),
