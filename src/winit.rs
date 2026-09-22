@@ -14,7 +14,7 @@ use smithay::{
 };
 
 use crate::backend::RenderBackend;
-use crate::protocol::Transform;
+use crate::protocol::{ScreenInfo, Transform};
 use crate::wayland::App;
 
 pub struct WinitBackend {
@@ -182,6 +182,24 @@ impl RenderBackend for WinitBackend {
         self.height
     }
 
+    fn get_screens(&self) -> Vec<ScreenInfo> {
+        let (width, height, refresh_rate) =
+            match self.output.as_ref().and_then(|o| o.current_mode()) {
+                Some(mode) => (
+                    mode.size.w.max(0) as u32,
+                    mode.size.h.max(0) as u32,
+                    (mode.refresh / 1000).max(0) as u32,
+                ),
+                None => (self.width, self.height, 60),
+            };
+        vec![ScreenInfo {
+            name: "winit".to_string(),
+            width,
+            height,
+            refresh_rate,
+        }]
+    }
+
     fn get_output_count(&self) -> usize {
         if self.output.is_some() {
             1
@@ -190,7 +208,12 @@ impl RenderBackend for WinitBackend {
         }
     }
 
-    fn render_space(&mut self, _state: &mut App, _configs: &[crate::renderer::ScreenConfig]) {
+    fn render_space(
+        &mut self,
+        _state: &mut App,
+        _configs: &[crate::renderer::ScreenConfig],
+        _canvas_size: Option<(u32, u32)>,
+    ) {
         // Winit backend handles rendering through its own event loop (WinitEvent::Redraw)
         // so this is a no-op here.
     }

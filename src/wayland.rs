@@ -40,7 +40,6 @@ pub struct App {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
-
     // 自定义配置状态
 }
 

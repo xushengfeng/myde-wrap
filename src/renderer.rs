@@ -2,8 +2,8 @@ use crate::protocol::{Rect, ScreenInfo, Transform};
 use tracing::info;
 
 pub struct Renderer {
-    window_width: u32,
-    window_height: u32,
+    /// SetWindowSize 声明的虚拟画布尺寸（可突破物理屏幕）
+    canvas_size: Option<(u32, u32)>,
     captured_rects: Vec<Rect>,
     transforms: Vec<Transform>,
     screens: Vec<ScreenInfo>,
@@ -19,94 +19,33 @@ pub struct ScreenConfig {
 }
 
 impl Renderer {
-    pub fn new() -> Self {
-        let screens = Self::detect_screens();
-        let default_screen = &screens[0];
-        let window_width = default_screen.width;
-        let window_height = default_screen.height;
-
-        info!(
-            "default screen: {} ({}x{})",
-            default_screen.name, window_width, window_height
-        );
-
-        let captured_rects = vec![Rect {
-            x: 0,
-            y: 0,
-            width: window_width,
-            height: window_height,
-        }];
-
-        let transforms = vec![Transform { rotation: 0.0 }];
+    /// `screens` 应传入渲染后端的真实输出信息
+    pub fn new(screens: Vec<ScreenInfo>) -> Self {
+        info!("screens: {:?}", screens);
+        if screens.is_empty() {
+            info!("no output detected, using auto canvas");
+        }
 
         Self {
-            window_width,
-            window_height,
-            captured_rects,
-            transforms,
+            canvas_size: None,
+            captured_rects: Vec::new(),
+            transforms: vec![Transform { rotation: 0.0 }],
             screens,
             input_enabled: true,
             screen_configs: Vec::new(),
         }
     }
 
-    fn detect_screens() -> Vec<ScreenInfo> {
-        // 尝试从环境变量获取屏幕信息
-        if let Ok(output) = std::process::Command::new("xrandr").arg("--query").output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut screens = Vec::new();
-
-            for line in stdout.lines() {
-                if line.contains(" connected") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    let name = parts[0].to_string();
-
-                    // 查找分辨率信息，如 "1920x1080+0+0"
-                    for part in &parts[2..] {
-                        if part.contains('x') && part.contains('+') {
-                            let res_part = part.split('+').next().unwrap_or("");
-                            let dims: Vec<&str> = res_part.split('x').collect();
-                            if dims.len() == 2 {
-                                if let (Ok(width), Ok(height)) =
-                                    (dims[0].parse::<u32>(), dims[1].parse::<u32>())
-                                {
-                                    screens.push(ScreenInfo {
-                                        name,
-                                        width,
-                                        height,
-                                        refresh_rate: 60,
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !screens.is_empty() {
-                return screens;
-            }
-        }
-
-        // 如果无法检测，返回默认屏幕
-        info!("failed to detect screen info, using default configuration");
-        vec![ScreenInfo {
-            name: "Screen-0".to_string(),
-            width: 1920,
-            height: 1080,
-            refresh_rate: 60,
-        }]
-    }
-
+    /// SetWindowSize：声明虚拟画布尺寸（不强制修改应用窗口大小，
+    /// 应用窗口由应用自行控制）。实际画布 = max(声明尺寸, 应用窗口尺寸)，
+    /// 保证虚拟画布不裁切应用。
     pub fn set_window_size(&mut self, width: u32, height: u32) {
-        self.window_width = width;
-        self.window_height = height;
+        self.canvas_size = Some((width, height));
     }
 
-    #[allow(dead_code)]
-    pub fn get_window_size(&self) -> (u32, u32) {
-        (self.window_width, self.window_height)
+    /// 获取 SetWindowSize 声明的虚拟画布尺寸（None 表示未声明，自动跟随应用窗口）
+    pub fn get_canvas_size(&self) -> Option<(u32, u32)> {
+        self.canvas_size
     }
 
     pub fn capture_rects(&mut self, rects: Vec<Rect>) -> Vec<Rect> {
@@ -178,31 +117,12 @@ impl Renderer {
         &self.screen_configs
     }
 
-    // 获取默认的全屏配置
+    // 获取默认的全屏配置：rects 留空表示"整个画布"（自动取
+    // max(SetWindowSize 声明尺寸, 应用窗口尺寸)），拉伸铺满屏幕
     pub fn get_default_fullscreen_config(&self, screen_index: usize) -> ScreenConfig {
-        if screen_index >= self.screens.len() {
-            return ScreenConfig {
-                screen_index,
-                rects: vec![Rect {
-                    x: 0,
-                    y: 0,
-                    width: self.window_width,
-                    height: self.window_height,
-                }],
-                transforms: vec![Transform { rotation: 0.0 }],
-            };
-        }
-
-        let screen = &self.screens[screen_index];
-
         ScreenConfig {
             screen_index,
-            rects: vec![Rect {
-                x: 0,
-                y: 0,
-                width: self.window_width,
-                height: self.window_height,
-            }],
+            rects: Vec::new(),
             transforms: vec![Transform { rotation: 0.0 }],
         }
     }

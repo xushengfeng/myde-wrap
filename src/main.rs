@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 将Socket服务器添加到事件循环中
     let loop_handle = event_loop.handle();
     let socket_server = Arc::new(socket_server);
-    let renderer = Arc::new(Mutex::new(MyRenderer::new()));
+    let renderer = Arc::new(Mutex::new(MyRenderer::new(backend.get_screens())));
     let compositor = Arc::new(Compositor::new(renderer.clone()));
     let backend = Arc::new(Mutex::new(backend));
 
@@ -229,11 +229,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop_handle.insert_source(timer, move |_event, _, state| {
             let mut backend_guard = backend_for_render.blocking_lock();
             backend_guard.dispatch();
-            let configs = renderer_for_timer
-                .blocking_lock()
-                .get_screen_configs()
-                .to_vec();
-            backend_guard.render_space(state, &configs);
+            let (configs, canvas_size) = {
+                let renderer_guard = renderer_for_timer.blocking_lock();
+                (
+                    renderer_guard.get_screen_configs().to_vec(),
+                    renderer_guard.get_canvas_size(),
+                )
+            };
+            backend_guard.render_space(state, &configs, canvas_size);
             TimeoutAction::ToDuration(Duration::from_millis(16)) // ~60fps
         })?;
     }
@@ -258,7 +261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for screen_index in 0..backend_output_count {
             let config = renderer_guard.get_default_fullscreen_config(screen_index);
             info!(
-                "setting default fullscreen config: screen {}, rects {:?}, transforms {:?}",
+                "setting default fullscreen config: screen {}, rects {:?}, transforms {:?} (rects 留空 = 整个画布拉伸铺满)",
                 screen_index, config.rects, config.transforms
             );
             // SAVE IT into the renderer so that DRM backend can actually use it

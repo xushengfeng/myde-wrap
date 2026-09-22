@@ -15,24 +15,23 @@ pub struct Rect {
 
 /// 变换参数定义
 ///
-/// 变换顺序：先缩放，后平移
-/// 缩放原点：矩形左上角 (rect.x, rect.y)
+/// 旋转作用于**截取**阶段：截取区域以 (rect.x, rect.y) 为锚点、绕锚点旋转 rotation 度，
+/// 长宽为 rect.width × rect.height；截取结果转正后拉伸填充到目标屏幕
+///（隐式缩放：scale = 屏幕尺寸 / 截取长宽），并保持直角。
 ///
-/// 变换公式：
-///   final_x = rect.x + (rect.x * scale_x - rect.x) + translate_x
-///           = rect.x * scale_x + translate_x
-///   final_y = rect.y + (rect.y * scale_y - rect.y) + translate_y
-///           = rect.y * scale_y + translate_y
-///   final_width = rect.width * scale_x
-///   final_height = rect.height * scale_y
+/// 等价于：把画布绕 (rect.x, rect.y) 旋转 -rotation 度后，
+/// 截取以锚点为左上角的 rect.width × rect.height 区域，拉伸铺满目标屏幕。
 ///
-/// 示例：
-///   - scale_x=2.0, scale_y=2.0: 矩形以左上角为原点放大2倍
-///   - translate_x=100, translate_y=50: 矩形向右移动100像素，向下移动50像素
-///   - scale_x=0.5, scale_y=0.5, translate_x=200: 矩形缩小一半，然后向右移动200像素
+/// `rects` 与 `transforms` 按下标配对：rects[i] 对应 transforms[i]（缺省 rotation = 0）。
+/// 同一屏幕配置多个区域时按数组顺序叠放，靠前的在下层。
+///
+/// 示例（rect = {x: 0, y: 0, width: 800, height: 600}）：
+///   - rotation=0: 截取 (0, 0, 800, 600)，拉伸铺满屏幕
+///   - rotation=15: 区域绕 (0, 0) 偏转 15° 截取（显示内容逆时针偏转），转正后拉伸铺满屏幕
+///   - rotation=90: 截取竖条区域，转正后拉伸铺满屏幕
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transform {
-    /// 旋转/倾斜角度（度）
+    /// 截取区域相对画布的旋转角度（度）
     pub rotation: f64,
 }
 
@@ -68,6 +67,12 @@ pub enum ClientMessage {
     TransformRects {
         transforms: Vec<Transform>,
     },
+    /// 将画布截取区域渲染到屏幕
+    ///
+    /// - `rects[i]` 与 `transforms[i]` 按下标配对（缺省 rotation = 0）
+    /// - 每个区域以 (x, y) 为锚点旋转截取，转正后拉伸填充到 `screen_index` 屏幕
+    /// - `rects` 留空表示整个画布
+    /// - 同一屏幕多个区域按数组顺序叠放，靠前的在下层
     RenderToScreen {
         screen_index: usize,
         rects: Vec<Rect>,

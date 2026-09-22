@@ -12,10 +12,7 @@ use smithay::{
         },
         egl::{context::EGLContext, display::EGLDisplay},
         renderer::{
-            element::{
-                surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-                Element,
-            },
+            element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
             gles::GlesRenderer,
         },
     },
@@ -30,8 +27,26 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 use crate::backend::RenderBackend;
-use crate::protocol::Transform;
+use crate::protocol::{Rect, ScreenInfo, Transform};
 use crate::wayland::App;
+
+/// 默认画布矩形：SetWindowSize 声明的画布与应用窗口实际尺寸取大，
+/// 保证虚拟画布不裁切应用。
+/// 画布坐标系原点为窗口内容（xdg window geometry）左上角。
+fn default_canvas_rect(state: &App, canvas_size: Option<(u32, u32)>) -> Rect {
+    let (mut width, mut height) = canvas_size.unwrap_or((0, 0));
+    for window in state.space.elements() {
+        let geo = window.geometry();
+        width = width.max(geo.size.w.max(0) as u32);
+        height = height.max(geo.size.h.max(0) as u32);
+    }
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
 
 struct DrmOutputData {
     crtc: crtc::Handle,
@@ -44,7 +59,7 @@ struct DrmOutputData {
 
 pub enum MyElement {
     Wayland(WaylandSurfaceRenderElement<GlesRenderer>),
-    Custom(crate::custom_element::CustomRotatedElement),
+    Custom(crate::custom_element::CropStretchElement),
 }
 
 impl smithay::backend::renderer::element::Element for MyElement {
@@ -130,6 +145,19 @@ impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for MyElem
     }
 }
 
+type GbmDrmCompositor = DrmCompositor<
+    GbmAllocator<Arc<OwnedFd>>,
+    GbmFramebufferExporter<Arc<OwnedFd>>,
+    (),
+    Arc<OwnedFd>,
+>;
+
+/// 每个输出的渲染运行时（与 `DrmBackend::outputs` 按下标一一对应）
+struct DrmOutputRuntime {
+    compositor: GbmDrmCompositor,
+    needs_vblank: bool,
+}
+
 pub struct DrmBackend {
     width: u32,
     height: u32,
@@ -138,22 +166,16 @@ pub struct DrmBackend {
     device_fd: Option<DrmDeviceFd>,
     gbm: Option<GbmDevice<Arc<OwnedFd>>>,
     renderer: Option<GlesRenderer>,
-    drm_compositor: Option<
-        DrmCompositor<
-            GbmAllocator<Arc<OwnedFd>>,
-            GbmFramebufferExporter<Arc<OwnedFd>>,
-            (),
-            Arc<OwnedFd>,
-        >,
-    >,
+    compositors: Vec<DrmOutputRuntime>,
     start_time: Instant,
     frame_count: u64,
-    rx: Option<std::sync::mpsc::Receiver<()>>,
-    tx: Option<std::sync::mpsc::Sender<()>>,
-    needs_vblank: bool,
+    /// VBlank 事件通道，携带发生翻页的 crtc
+    rx: Option<std::sync::mpsc::Receiver<crtc::Handle>>,
+    tx: Option<std::sync::mpsc::Sender<crtc::Handle>>,
     pub rotate_shader: Option<smithay::backend::renderer::gles::GlesTexProgram>,
+    /// 画布离屏纹理（随画布尺寸变化重建）
     pub offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture>,
-    offscreen_id: smithay::backend::renderer::element::Id,
+    offscreen_size: Option<(u32, u32)>,
 }
 
 // SAFETY: GlesRenderer contains raw pointers that are not Send, but it's safe to send
@@ -172,15 +194,14 @@ impl DrmBackend {
             device_fd: None,
             gbm: None,
             renderer: None,
-            drm_compositor: None,
+            compositors: Vec::new(),
             start_time: Instant::now(),
             frame_count: 0,
             rx: Some(rx),
             tx: Some(tx),
-            needs_vblank: false,
             rotate_shader: None,
             offscreen_texture: None,
-            offscreen_id: smithay::backend::renderer::element::Id::new(),
+            offscreen_size: None,
         }
     }
 }
@@ -215,8 +236,8 @@ impl RenderBackend for DrmBackend {
                     _event_loop
                         .handle()
                         .insert_source(drm_event, move |event, _meta, _state| {
-                            if let smithay::backend::drm::DrmEvent::VBlank(_) = event {
-                                let _ = tx.send(());
+                            if let smithay::backend::drm::DrmEvent::VBlank(handle) = event {
+                                let _ = tx.send(handle);
                             }
                         })
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -235,7 +256,8 @@ impl RenderBackend for DrmBackend {
                                 let enc_info = dev.get_encoder(enc)?;
                                 let filter = enc_info.possible_crtcs();
 
-                                for c in res.filter_crtcs(filter) {
+                                // 取第一个可用的 crtc
+                                if let Some(c) = res.filter_crtcs(filter).into_iter().next() {
                                     let smithay_mode = smithay::output::Mode {
                                         size: (mode.size().0 as i32, mode.size().1 as i32).into(),
                                         refresh: (mode.vrefresh() * 1000) as i32,
@@ -270,7 +292,6 @@ impl RenderBackend for DrmBackend {
                                     };
                                     self.outputs.push(output_data);
                                     info!("Added output: CRTC {:?}, connector {:?}", c, conn);
-                                    break;
                                 }
                                 if !self.outputs.is_empty() {
                                     break;
@@ -335,20 +356,31 @@ uniform sampler2D tex;
 
 uniform float alpha;
 varying vec2 v_coords;
-uniform float custom_rotation;
+
+// 截取区域（画布像素）：左上角 (x, y)、长宽 (w, h)
+uniform vec4 u_region;
+// 截取区域绕锚点 (x, y) 的旋转角（弧度）
+uniform float u_rotation;
+// 画布尺寸（像素）
+uniform vec2 u_canvas;
 
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
 
 void main() {
-    float c = cos(custom_rotation);
-    float s = sin(custom_rotation);
+    // v_coords 为满屏四边形的归一化坐标 [0,1]^2：
+    // 屏幕坐标 -> 截取区域坐标（拉伸填充，隐式缩放）
+    vec2 region = vec2(v_coords.x * u_region.z, v_coords.y * u_region.w);
 
-    // Rotate around (0.0, 0.0) which corresponds to rect.xy (top-left of the screen)
-    vec2 p = v_coords;
-    vec2 rp = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
-    vec2 uv = rp;
+    // 区域以 (x, y) 为锚点、绕锚点旋转，采样画布：
+    // 等价于把画布绕 (x, y) 旋转 -u_rotation 后截取 (0, 0, w, h) 拉伸上屏，
+    // 旋转作用在截取阶段，直角得以保持
+    float c = cos(u_rotation);
+    float s = sin(u_rotation);
+    vec2 canvas = u_region.xy + vec2(region.x * c - region.y * s, region.x * s + region.y * c);
+
+    vec2 uv = canvas / u_canvas;
 
     vec4 color;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -371,55 +403,62 @@ void main() {
     gl_FragColor = color;
 }
 "#,
-            &[smithay::backend::renderer::gles::UniformName::new(
-                "custom_rotation",
-                smithay::backend::renderer::gles::UniformType::_1f,
-            )],
+            &[
+                smithay::backend::renderer::gles::UniformName::new(
+                    "u_region",
+                    smithay::backend::renderer::gles::UniformType::_4f,
+                ),
+                smithay::backend::renderer::gles::UniformName::new(
+                    "u_rotation",
+                    smithay::backend::renderer::gles::UniformType::_1f,
+                ),
+                smithay::backend::renderer::gles::UniformName::new(
+                    "u_canvas",
+                    smithay::backend::renderer::gles::UniformType::_2f,
+                ),
+            ],
         )?;
 
-        let offscreen_size = smithay::utils::Size::from((self.width as i32, self.height as i32));
-        use smithay::backend::renderer::Offscreen;
-        let offscreen_texture = renderer
-            .create_buffer(
-                smithay::backend::allocator::Fourcc::Argb8888,
-                offscreen_size,
-            )
-            .ok();
+        // 为每个输出创建独立的 DRM compositor（多屏支持）
+        for output_data in &self.outputs {
+            let surface = device.create_surface(
+                output_data.crtc,
+                output_data.mode,
+                &[output_data.connector],
+            )?;
 
-        // Create DRM compositor for the first output
-        let first_output = &self.outputs[0];
-        let surface = device.create_surface(
-            first_output.crtc,
-            first_output.mode,
-            &[first_output.connector],
-        )?;
+            let output_mode_source = OutputModeSource::from(&output_data.smithay_output);
 
-        let output_mode_source = OutputModeSource::from(&first_output.smithay_output);
+            let allocator = GbmAllocator::new(
+                gbm.clone(),
+                GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING,
+            );
+            let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), None);
 
-        let allocator = GbmAllocator::new(
-            gbm.clone(),
-            GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING,
-        );
-        let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), None);
+            // Get renderer formats
+            let color_formats = [DrmFourcc::Argb8888];
+            let renderer_formats = [DrmFormat {
+                code: DrmFourcc::Argb8888,
+                modifier: DrmModifier::Invalid,
+            }];
 
-        // Get renderer formats
-        let color_formats = [DrmFourcc::Argb8888];
-        let renderer_formats = [DrmFormat {
-            code: DrmFourcc::Argb8888,
-            modifier: DrmModifier::Invalid,
-        }];
+            let compositor = DrmCompositor::new(
+                output_mode_source,
+                surface,
+                None,
+                allocator,
+                framebuffer_exporter,
+                color_formats.into_iter(),
+                renderer_formats.into_iter(),
+                device.cursor_size(),
+                Some(gbm.clone()),
+            )?;
 
-        let drm_compositor = DrmCompositor::new(
-            output_mode_source,
-            surface,
-            None,
-            allocator,
-            framebuffer_exporter,
-            color_formats.into_iter(),
-            renderer_formats.into_iter(),
-            device.cursor_size(),
-            Some(gbm.clone()),
-        )?;
+            self.compositors.push(DrmOutputRuntime {
+                compositor,
+                needs_vblank: false,
+            });
+        }
 
         // Register outputs to space
         for output_data in &self.outputs {
@@ -430,9 +469,7 @@ void main() {
         self.device_fd = Some(device_fd);
         self.gbm = Some(gbm);
         self.renderer = Some(renderer);
-        self.drm_compositor = Some(drm_compositor);
         self.rotate_shader = Some(shader);
-        self.offscreen_texture = offscreen_texture;
 
         info!(
             "DRM backend initialized, found {} outputs",
@@ -463,12 +500,15 @@ void main() {
     }
 
     fn dispatch(&mut self) {
-        // Handle DRM events sent via channel from the calloop source
-        if let Some(rx) = &self.rx {
-            while let Ok(_) = rx.try_recv() {
-                self.needs_vblank = false;
-                if let Some(compositor) = &mut self.drm_compositor {
-                    let _ = compositor.frame_submitted();
+        // Handle DRM events sent via channel from the calloop source.
+        // VBlank 按 crtc 路由到对应输出的 compositor 完成翻页。
+        if let Some(rx) = self.rx.as_ref() {
+            while let Ok(handle) = rx.try_recv() {
+                if let Some(index) = self.outputs.iter().position(|o| o.crtc == handle) {
+                    if let Some(runtime) = self.compositors.get_mut(index) {
+                        runtime.needs_vblank = false;
+                        let _ = runtime.compositor.frame_submitted();
+                    }
                 }
             }
         }
@@ -482,204 +522,242 @@ void main() {
         self.height
     }
 
+    fn get_screens(&self) -> Vec<ScreenInfo> {
+        self.outputs
+            .iter()
+            .map(|output| ScreenInfo {
+                name: format!("DRM-{:?}", output.crtc),
+                width: output.width,
+                height: output.height,
+                refresh_rate: output.mode.vrefresh(),
+            })
+            .collect()
+    }
+
     fn get_output_count(&self) -> usize {
         self.outputs.len()
     }
 
-    fn render_space(&mut self, state: &mut App, configs: &[crate::renderer::ScreenConfig]) {
-        if self.needs_vblank {
-            return;
-        }
+    fn render_space(
+        &mut self,
+        state: &mut App,
+        configs: &[crate::renderer::ScreenConfig],
+        canvas_size: Option<(u32, u32)>,
+    ) {
+        self.frame_count += 1;
 
-        let renderer = match &mut self.renderer {
+        // 画布 = max(SetWindowSize 声明, 应用窗口内容尺寸)，坐标原点为窗口内容左上角
+        let canvas = default_canvas_rect(state, canvas_size);
+        let canvas_valid = canvas.width > 0 && canvas.height > 0;
+
+        let renderer = match self.renderer.as_mut() {
             Some(r) => r,
             None => return,
         };
 
-        let compositor = match &mut self.drm_compositor {
-            Some(c) => c,
-            None => return,
-        };
-
-        self.frame_count += 1;
-
-        let output_data = &self.outputs[0];
-        let screen_index = 0; // For now we only render the first DRM output
-
-        // Find config for this screen
-        let config = configs.iter().find(|c| c.screen_index == screen_index);
-
-        let mut scale_x = 1.0;
-        let mut scale_y = 1.0;
-        let mut loc_x = 0;
-        let mut loc_y = 0;
-        let mut rotation = 0.0;
-
-        if let Some(config) = config {
-            if let Some(rect) = config.rects.first() {
-                let screen_w = output_data.width as f64;
-                let screen_h = output_data.height as f64;
-
-                scale_x = screen_w / (rect.width as f64).max(1.0);
-                scale_y = screen_h / (rect.height as f64).max(1.0);
-
-                loc_x = -(rect.x as f64 * scale_x).round() as i32;
-                loc_y = -(rect.y as f64 * scale_y).round() as i32;
-            }
-            if let Some(transform) = config.transforms.first() {
-                rotation = transform.rotation;
-            }
-        }
-
-        // Update output transform based on rotation
-        let transform = match rotation {
-            r if (r >= 45.0 && r < 135.0) || (r <= -225.0 && r > -315.0) => {
-                smithay::utils::Transform::_90
-            }
-            r if (r >= 135.0 && r < 225.0) || (r <= -135.0 && r > -225.0) => {
-                smithay::utils::Transform::_180
-            }
-            r if (r >= 225.0 && r < 315.0) || (r <= -45.0 && r > -135.0) => {
-                smithay::utils::Transform::_270
-            }
-            _ => smithay::utils::Transform::Normal,
-        };
-        output_data
-            .smithay_output
-            .change_current_state(None, Some(transform), None, None);
-
-        let scale = smithay::utils::Scale::from((scale_x, scale_y));
-
-        // Collect render elements from all windows in the space
+        // Collect render elements from all windows in the space.
+        // 与 smithay 的 Space 渲染保持一致：窗口原点对应 xdg window geometry 的
+        // 原点，而 surface tree 的原点相对窗口原点偏移 geometry().loc
+        //（CSD 阴影/边距）。渲染 surface tree 时减去该偏移，
+        // 把窗口内容原点放在画布 (0, 0)。画布 1:1 渲染（scale = 1）。
         let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
             .space
             .elements()
             .flat_map(|window| {
                 let surface = window.toplevel().unwrap().wl_surface().clone();
-                // 与 smithay 的 Space 渲染保持一致：窗口原点对应 xdg_window_geometry 的
-                // 原点，而 surface tree 的原点相对窗口原点偏移 geometry().loc
-                //（CSD 阴影/边距）。渲染 surface tree 时必须减去该偏移，
-                // 否则内容会整体向右下偏移。
-                let geometry_offset: smithay::utils::Point<i32, smithay::utils::Physical> =
-                    window.geometry().loc.to_physical_precise_round(scale);
+                let geometry_loc = window.geometry().loc;
                 render_elements_from_surface_tree(
                     renderer,
                     &surface,
-                    (loc_x - geometry_offset.x, loc_y - geometry_offset.y),
-                    scale,
+                    (-geometry_loc.x, -geometry_loc.y),
+                    smithay::utils::Scale::from(1.0),
                     1.0,
                     smithay::backend::renderer::element::Kind::Unspecified,
                 )
             })
             .collect();
 
-        // If we have an offscreen texture and a rotate shader, render to it first
-        let mut final_elements: Vec<MyElement> = Vec::new();
-        let mut offscreen_success = false;
+        // —— 第一遍：把画布内容 1:1 渲入离屏纹理（随画布尺寸变化重建）——
+        let mut offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture> = None;
+        let mut crop_shader: Option<smithay::backend::renderer::gles::GlesTexProgram> = None;
 
-        if let (Some(tex), Some(shader)) =
-            (self.offscreen_texture.as_mut(), self.rotate_shader.as_ref())
-        {
-            use smithay::backend::renderer::{Bind, Frame, Renderer};
+        if canvas_valid && self.rotate_shader.is_some() {
+            let need_recreate = match (&self.offscreen_texture, self.offscreen_size) {
+                (Some(_), Some(sz)) => sz != (canvas.width, canvas.height),
+                _ => true,
+            };
+            if need_recreate {
+                self.offscreen_texture = None;
+                self.offscreen_size = None;
+                let size = smithay::utils::Size::from((canvas.width as i32, canvas.height as i32));
+                use smithay::backend::renderer::Offscreen;
+                self.offscreen_texture = renderer
+                    .create_buffer(smithay::backend::allocator::Fourcc::Argb8888, size)
+                    .ok();
+                if self.offscreen_texture.is_some() {
+                    self.offscreen_size = Some((canvas.width, canvas.height));
+                }
+            }
+
+            if let (Some(tex), Some(shader)) =
+                (self.offscreen_texture.as_mut(), self.rotate_shader.as_ref())
             {
-                let mut target = renderer.bind(tex).unwrap();
-                let mut frame = renderer
-                    .render(
-                        &mut target,
-                        smithay::utils::Size::from((self.width as i32, self.height as i32)),
-                        smithay::utils::Transform::Normal,
-                    )
-                    .unwrap();
+                use smithay::backend::renderer::{Bind, Frame, Renderer};
+                {
+                    let size =
+                        smithay::utils::Size::from((canvas.width as i32, canvas.height as i32));
+                    let mut target = renderer.bind(tex).unwrap();
+                    let mut frame = renderer
+                        .render(&mut target, size, smithay::utils::Transform::Normal)
+                        .unwrap();
 
-                let damage = [smithay::utils::Rectangle::from_size(
-                    smithay::utils::Size::from((self.width as i32, self.height as i32)),
-                )];
-                let _ = frame.clear(
-                    smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 0.0),
-                    &damage,
-                );
-
-                for element in &elements {
-                    use smithay::backend::renderer::element::{Element, RenderElement};
-                    let _ = element.draw(
-                        &mut frame,
-                        element.src(),
-                        // 必须使用创建元素时的 scale，geometry() 会按传入的 scale
-                        // 计算目标尺寸，传 1.0 会导致非 1:1 截取时位置/尺寸错误
-                        element.geometry(scale),
+                    let damage = [smithay::utils::Rectangle::from_size(size)];
+                    let _ = frame.clear(
+                        smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 0.0),
                         &damage,
-                        &[],
+                    );
+
+                    for element in &elements {
+                        use smithay::backend::renderer::element::{Element, RenderElement};
+                        let _ = element.draw(
+                            &mut frame,
+                            element.src(),
+                            element.geometry(smithay::utils::Scale::from(1.0)),
+                            &damage,
+                            &[],
+                        );
+                    }
+                }
+
+                offscreen_texture = Some(tex.clone());
+                crop_shader = Some(shader.clone());
+            }
+        }
+
+        // —— 第二遍：每个屏幕把（截取区域 → 屏幕）的映射渲上屏 ——
+        for (index, (output_data, runtime)) in self
+            .outputs
+            .iter()
+            .zip(self.compositors.iter_mut())
+            .enumerate()
+        {
+            // 该输出还在等上一帧翻页则跳过
+            if runtime.needs_vblank {
+                continue;
+            }
+
+            let config = configs.iter().find(|c| c.screen_index == index);
+
+            // rects[i] 与 transforms[i] 配对（缺省 rotation = 0）；
+            // rects 留空（或无配置）= 整个画布（默认行为）
+            let pairs: Vec<(Rect, f64)> = match config {
+                Some(c) if !c.rects.is_empty() => c
+                    .rects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rect)| {
+                        let rotation = c.transforms.get(i).map(|t| t.rotation).unwrap_or(0.0);
+                        (rect.clone(), rotation)
+                    })
+                    .collect(),
+                _ => vec![(canvas.clone(), 0.0)],
+            };
+
+            let screen_size =
+                smithay::utils::Size::from((output_data.width as i32, output_data.height as i32));
+            let mut final_elements: Vec<MyElement> = Vec::new();
+
+            if let (Some(tex), Some(shader)) = (offscreen_texture.as_ref(), crop_shader.as_ref()) {
+                // 每个（截取区域, 旋转）对渲成一个旋转截取+拉伸填充元素。
+                // render_frame 绘制时 slice 首元素在最上层，倒序入栈实现
+                // “rects 靠前的在下层，靠后的在上层”。
+                for (rect, rotation) in pairs.iter().rev() {
+                    final_elements.push(MyElement::Custom(
+                        crate::custom_element::CropStretchElement {
+                            id: smithay::backend::renderer::element::Id::new(),
+                            texture: tex.clone(),
+                            src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from(
+                                (canvas.width as f64, canvas.height as f64),
+                            )),
+                            region: rect.clone(),
+                            rotation: *rotation,
+                            dst: smithay::utils::Rectangle::from_size(screen_size),
+                            shader: shader.clone(),
+                        },
+                    ));
+                }
+            } else {
+                // 回退：离屏纹理不可用时按拉伸逻辑直接渲 surface tree
+                //（无旋转、仅首个区域）
+                let (rect, _) = &pairs[0];
+                let scale_x = output_data.width as f64 / (rect.width as f64).max(1.0);
+                let scale_y = output_data.height as f64 / (rect.height as f64).max(1.0);
+                let scale = smithay::utils::Scale::from((scale_x, scale_y));
+                let loc_x = -(rect.x as f64 * scale_x).round() as i32;
+                let loc_y = -(rect.y as f64 * scale_y).round() as i32;
+
+                for window in state.space.elements() {
+                    let surface = window.toplevel().unwrap().wl_surface().clone();
+                    let geometry_offset: smithay::utils::Point<i32, smithay::utils::Physical> =
+                        window.geometry().loc.to_physical_precise_round(scale);
+                    let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                        render_elements_from_surface_tree(
+                            renderer,
+                            &surface,
+                            (loc_x - geometry_offset.x, loc_y - geometry_offset.y),
+                            scale,
+                            1.0,
+                            smithay::backend::renderer::element::Kind::Unspecified,
+                        );
+                    final_elements.extend(elems.into_iter().map(MyElement::Wayland));
+                }
+            }
+
+            // Render frame
+            match runtime.compositor.render_frame::<_, MyElement>(
+                renderer,
+                &final_elements,
+                [0.1, 0.1, 0.1, 1.0],
+                FrameFlags::DEFAULT,
+            ) {
+                Ok(render_frame_result) => {
+                    if !render_frame_result.is_empty {
+                        // Queue the frame for display
+                        if let Err(e) = runtime.compositor.queue_frame(()) {
+                            error!(
+                                "Frame {}: Failed to queue DRM frame for output {}: {}",
+                                self.frame_count, index, e
+                            );
+                            continue;
+                        }
+                        runtime.needs_vblank = true;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Frame {}: DRM render_frame failed for output {}: {:?}",
+                        self.frame_count, index, e
                     );
                 }
             }
-
-            offscreen_success = true;
-            final_elements.push(MyElement::Custom(
-                crate::custom_element::CustomRotatedElement {
-                    id: self.offscreen_id.clone(),
-                    texture: tex.clone(),
-                    src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
-                        self.width as f64,
-                        self.height as f64,
-                    ))),
-                    dst: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
-                        self.width as i32,
-                        self.height as i32,
-                    ))),
-                    rotation,
-                    shader: shader.clone(),
-                },
-            ));
         }
 
-        if !offscreen_success {
-            for element in elements {
-                final_elements.push(MyElement::Wayland(element));
-            }
+        // 无论是否出帧都给客户端发 frame 事件，避免阻塞
+        if let Some(output_data) = self.outputs.first() {
+            let output = &output_data.smithay_output;
+            state.space.elements().for_each(|window| {
+                window.send_frame(
+                    output,
+                    self.start_time.elapsed(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                )
+            });
         }
 
-        // Render frame
-        match compositor.render_frame::<_, MyElement>(
-            renderer,
-            &final_elements,
-            [0.1, 0.1, 0.1, 1.0],
-            FrameFlags::DEFAULT,
-        ) {
-            Ok(render_frame_result) => {
-                if !render_frame_result.is_empty {
-                    // Queue the frame for display
-                    if let Err(e) = compositor.queue_frame(()) {
-                        error!(
-                            "Frame {}: Failed to queue DRM frame: {}",
-                            self.frame_count, e
-                        );
-                        return;
-                    }
-                    self.needs_vblank = true;
-                }
-
-                // Always send frame events to Wayland clients so they are not blocked
-                let output = &self.outputs[0].smithay_output;
-                state.space.elements().for_each(|window| {
-                    window.send_frame(
-                        output,
-                        self.start_time.elapsed(),
-                        Some(Duration::ZERO),
-                        |_, _| Some(output.clone()),
-                    )
-                });
-
-                state.space.refresh();
-                state.popups.cleanup();
-                let _ = state.display_handle.flush_clients();
-            }
-            Err(e) => {
-                error!(
-                    "Frame {}: DRM render_frame failed: {:?}",
-                    self.frame_count, e
-                );
-            }
-        }
+        state.space.refresh();
+        state.popups.cleanup();
+        let _ = state.display_handle.flush_clients();
     }
 
     fn frame_submitted(&mut self) {
