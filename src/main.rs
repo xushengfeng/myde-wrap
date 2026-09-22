@@ -40,8 +40,17 @@ struct Args {
     command: Vec<String>,
 
     /// 渲染后端 (winit 或 drm)
-    #[arg(short, long, default_value = "winit")]
+    #[arg(short, long, default_value = "winit", value_parser = ["winit", "drm"])]
     backend: String,
+
+    /// 本程序日志级别 (error|warn|info|debug|trace|off)，默认 info；
+    /// 显式指定时优先于 RUST_LOG 环境变量
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// 子进程 stdout/stderr 处理方式 (inherit|null)，默认 inherit
+    #[arg(long, value_name = "MODE", default_value = "inherit")]
+    child_output: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,16 +58,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.command.is_empty() {
         eprintln!("错误: 请指定要渲染的程序");
-        eprintln!("用法: myde-wrap [--backend winit|drm] <command> [args...]");
+        eprintln!("用法: myde-wrap [--backend winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
         std::process::exit(1);
     }
 
-    // Initialize logging
-    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    } else {
-        tracing_subscriber::fmt().init();
+    let valid_levels = ["error", "warn", "info", "debug", "trace", "off"];
+    if let Some(level) = &args.log_level {
+        if !valid_levels.contains(&level.as_str()) {
+            eprintln!("错误: 无效的日志级别 '{}'", level);
+            eprintln!("可选值: {}", valid_levels.join("|"));
+            std::process::exit(1);
+        }
     }
+    if args.child_output != "inherit" && args.child_output != "null" {
+        eprintln!("错误: 无效的子进程输出方式 '{}'", args.child_output);
+        eprintln!("可选值: inherit|null");
+        std::process::exit(1);
+    }
+
+    // Initialize logging: 显式 --log-level 优先，其次 RUST_LOG，最后默认 info
+    let env_filter = if let Some(level) = &args.log_level {
+        tracing_subscriber::EnvFilter::new(level)
+    } else if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        env_filter
+    } else {
+        tracing_subscriber::EnvFilter::new("info")
+    };
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let socket_path = std::env::temp_dir().join("myde-wrap.sock");
     let socket_server = SocketServer::new(socket_path.clone())?;
@@ -67,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<App> = Display::new()?;
     let mut state = App::new(&mut event_loop, display);
 
-    let is_drm = args.backend.as_str() != "drm";
+    let is_drm = args.backend.as_str() == "drm";
 
     // Create and initialize the selected backend
     let mut backend: Box<dyn RenderBackend> = if is_drm {
@@ -123,9 +149,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 让myde以桌面运行
     envs.push(("runAsDesktop".to_string(), "true".to_string()));
 
+    let child_stdio = || {
+        if args.child_output == "null" {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::inherit()
+        }
+    };
+
     let mut child = Command::new(program)
         .args(program_args)
         .envs(envs)
+        .stdout(child_stdio())
+        .stderr(child_stdio())
         .spawn()?;
 
     info!("program started, PID: {}", child.id());
