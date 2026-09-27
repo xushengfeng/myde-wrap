@@ -47,6 +47,8 @@ src/
 
 ### 编译命令
 
+`--backend` 缺省为 `auto`：先尝试 winit，初始化失败（如无宿主显示环境 `WAYLAND_DISPLAY`/`DISPLAY`）时自动回退 drm；显式指定 `winit` 或 `drm` 时严格按该后端初始化，失败即报错。
+
 ```bash
 # 运行（winit 后端）
 cargo run -- --backend winit <command> [args...]

@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::backend::RenderBackend;
 use crate::compositor::Compositor;
@@ -39,8 +39,9 @@ struct Args {
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
-    /// 渲染后端 (winit 或 drm)
-    #[arg(short, long, default_value = "winit", value_parser = ["winit", "drm"])]
+    /// 渲染后端 (auto|winit|drm)；auto 先尝试 winit，初始化失败（如无宿主显示
+    /// 环境 WAYLAND_DISPLAY/DISPLAY）时回退 drm
+    #[arg(short, long, default_value = "auto", value_parser = ["auto", "winit", "drm"])]
     backend: String,
 
     /// 本程序日志级别 (error|warn|info|debug|trace|off)，默认 info；
@@ -87,18 +88,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<App> = Display::new()?;
     let mut state = App::new(&mut event_loop, display);
 
-    let is_drm = args.backend.as_str() == "drm";
-
-    // Create and initialize the selected backend
-    let mut backend: Box<dyn RenderBackend> = if is_drm {
-        info!("using DRM backend");
-        Box::new(DrmBackend::new())
-    } else {
-        info!("using winit backend");
-        Box::new(WinitBackend::new())
+    // 创建并初始化后端
+    // 显式 --backend 严格按指定后端初始化；auto 模式先尝试 winit（宿主桌面窗口），
+    // 失败（如无 WAYLAND_DISPLAY/DISPLAY）时回退到 drm
+    let backend: Box<dyn RenderBackend> = match args.backend.as_str() {
+        "winit" => {
+            let mut b: Box<dyn RenderBackend> = Box::new(WinitBackend::new());
+            b.init(&mut event_loop, &mut state)?;
+            b
+        }
+        "drm" => {
+            let mut b: Box<dyn RenderBackend> = Box::new(DrmBackend::new());
+            b.init(&mut event_loop, &mut state)?;
+            b
+        }
+        _ => {
+            let mut winit: Box<dyn RenderBackend> = Box::new(WinitBackend::new());
+            match winit.init(&mut event_loop, &mut state) {
+                Ok(()) => winit,
+                Err(e) => {
+                    warn!("winit backend init failed: {e}, falling back to drm backend");
+                    let mut drm: Box<dyn RenderBackend> = Box::new(DrmBackend::new());
+                    drm.init(&mut event_loop, &mut state)
+                        .map_err(|e2| format!("backends all failed (winit: {e}; drm: {e2})"))?;
+                    drm
+                }
+            }
+        }
     };
-
-    backend.init(&mut event_loop, &mut state)?;
+    let is_drm = backend.name() == "drm";
     info!("backend inited: {}", backend.name());
 
     // Set WAYLAND_DISPLAY to our socket name, so child processes connect to myde-wrap
@@ -120,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             program = "linux-unpacked/myde"
         } else {
             eprintln!("错误: 请指定要渲染的程序");
-            eprintln!("用法: myde-wrap [--backend winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
+            eprintln!("用法: myde-wrap [--backend auto|winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
             std::process::exit(1);
         }
     } else {
