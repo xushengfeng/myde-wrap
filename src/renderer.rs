@@ -132,7 +132,4 @@ impl Renderer {
     }
 
     // 计算变换后的矩形（为了兼容旧接口，这里直接返回原矩形，因为拉伸由渲染器在渲染时负责）
-    pub fn compute_transformed_rect(rect: &Rect, _transform: &Transform) -> (i32, i32, u32, u32) {
-        (rect.x, rect.y, rect.width, rect.height)
-    }
 }

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 use crate::backend::RenderBackend;
-use crate::protocol::{Rect, ScreenInfo, Transform};
+use crate::protocol::{Rect, ScreenInfo};
 use crate::wayland::App;
 
 /// 计算画布相关矩形（内容坐标系：原点为窗口内容（xdg window geometry）左上角，
@@ -95,6 +95,9 @@ struct DrmOutputData {
     smithay_output: Output,
 }
 
+// Wayland 变体比 Custom 大 ~300B；渲染循环每帧构造元素，装箱会引入额外堆分配，
+// 这里保持内联以减少每帧分配开销
+#[allow(clippy::large_enum_variant)]
 pub enum MyElement {
     Wayland(WaylandSurfaceRenderElement<GlesRenderer>),
     Custom(crate::custom_element::CropStretchElement),
@@ -372,7 +375,6 @@ impl RenderBackend for DrmBackend {
         // Create EGL display from GBM device
         let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
         let egl_context = EGLContext::new(&egl_display)?;
-        let egl_context = EGLContext::new(&egl_display)?;
         let mut renderer = unsafe { GlesRenderer::new(egl_context)? };
 
         let shader = renderer.compile_custom_texture_shader(
@@ -487,8 +489,8 @@ void main() {
                 None,
                 allocator,
                 framebuffer_exporter,
-                color_formats.into_iter(),
-                renderer_formats.into_iter(),
+                color_formats,
+                renderer_formats,
                 device.cursor_size(),
                 Some(gbm.clone()),
             )?;
@@ -518,26 +520,6 @@ void main() {
         Ok(())
     }
 
-    fn render_rect(
-        &mut self,
-        screen_index: usize,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        _transform: &Transform,
-    ) {
-        if screen_index >= self.outputs.len() {
-            error!("Invalid screen index: {}", screen_index);
-            return;
-        }
-
-        info!(
-            "Render to screen {}: ({}, {}) {}x{}",
-            screen_index, x, y, width, height
-        );
-    }
-
     fn dispatch(&mut self) {
         // Handle DRM events sent via channel from the calloop source.
         // VBlank 按 crtc 路由到对应输出的 compositor 完成翻页。
@@ -551,14 +533,6 @@ void main() {
                 }
             }
         }
-    }
-
-    fn get_width(&self) -> u32 {
-        self.width
-    }
-
-    fn get_height(&self) -> u32 {
-        self.height
     }
 
     fn get_screens(&self) -> Vec<ScreenInfo> {
@@ -798,12 +772,5 @@ void main() {
         state.space.refresh();
         state.popups.cleanup();
         let _ = state.display_handle.flush_clients();
-    }
-
-    fn frame_submitted(&mut self) {
-        // This is called from the VBlank event handler
-        // In a proper implementation, we would wait for VBlank before rendering the next frame
-        // For now, we just log it
-        debug!("frame_submitted called");
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smithay::{
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Space, Window},
     input::{Seat, SeatState},
     reexports::{
         calloop::{
@@ -9,11 +9,9 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::wl_surface::WlSurface,
             Display, DisplayHandle,
         },
     },
-    utils::{Logical, Point},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         output::OutputManagerState,
@@ -35,10 +33,13 @@ pub struct App {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    // 协议状态句柄：即使当前无读取点也需随 App 保活（xdg-output 全局、seat 句柄）
+    #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<App>,
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
+    #[allow(dead_code)]
     pub seat: Seat<Self>,
     // 自定义配置状态
 }
@@ -148,19 +149,6 @@ impl App {
             .unwrap();
 
         socket_name
-    }
-
-    pub fn surface_under(
-        &self,
-        pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(s, p)| (s, (p + location).to_f64()))
-            })
     }
 
     pub fn process_input_event(

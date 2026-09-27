@@ -1,4 +1,4 @@
-use crate::protocol::{ScreenInfo, Transform};
+use crate::protocol::ScreenInfo;
 use crate::renderer::ScreenConfig;
 use crate::wayland::App;
 use smithay::reexports::calloop::EventLoop;
@@ -13,18 +13,7 @@ pub trait RenderBackend: Send {
         event_loop: &mut EventLoop<App>,
         state: &mut App,
     ) -> Result<(), Box<dyn std::error::Error>>;
-    fn render_rect(
-        &mut self,
-        screen_index: usize,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        transform: &Transform,
-    );
     fn dispatch(&mut self);
-    fn get_width(&self) -> u32;
-    fn get_height(&self) -> u32;
     fn get_output_count(&self) -> usize;
 
     /// Render the Wayland space contents to the screen.
@@ -39,12 +28,6 @@ pub trait RenderBackend: Send {
         _configs: &[ScreenConfig],
         _canvas_size: Option<(u32, u32)>,
     ) {
-        // Default implementation does nothing
-    }
-
-    /// Called when a frame has been submitted and the next frame can be rendered.
-    /// This is used for DRM page flip synchronization.
-    fn frame_submitted(&mut self) {
         // Default implementation does nothing
     }
 }

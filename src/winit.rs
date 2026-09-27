@@ -14,7 +14,7 @@ use smithay::{
 };
 
 use crate::backend::RenderBackend;
-use crate::protocol::{ScreenInfo, Transform};
+use crate::protocol::ScreenInfo;
 use crate::wayland::App;
 
 pub struct WinitBackend {
@@ -148,39 +148,7 @@ impl RenderBackend for WinitBackend {
         Ok(())
     }
 
-    fn render_rect(
-        &mut self,
-        screen_index: usize,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        transform: &Transform,
-    ) {
-        // Winit backend handles rendering through the event loop
-        // This is a no-op for winit backend
-        tracing::debug!(
-            "WinitBackend::render_rect({}, {}, {}, {}, {}, {:?})",
-            screen_index,
-            x,
-            y,
-            width,
-            height,
-            transform
-        );
-    }
-
-    fn dispatch(&mut self) {
-        // Winit backend handles dispatch through the event loop
-    }
-
-    fn get_width(&self) -> u32 {
-        self.width
-    }
-
-    fn get_height(&self) -> u32 {
-        self.height
-    }
+    fn dispatch(&mut self) {}
 
     fn get_screens(&self) -> Vec<ScreenInfo> {
         let (width, height, refresh_rate) =
