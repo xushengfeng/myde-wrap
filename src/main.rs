@@ -56,12 +56,6 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    if args.command.is_empty() {
-        eprintln!("错误: 请指定要渲染的程序");
-        eprintln!("用法: myde-wrap [--backend winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
-        std::process::exit(1);
-    }
-
     let valid_levels = ["error", "warn", "info", "debug", "trace", "off"];
     if let Some(level) = &args.log_level {
         if !valid_levels.contains(&level.as_str()) {
@@ -117,7 +111,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("WAYLAND_DISPLAY={:?}", state.socket_name);
     info!("XDG_SESSION_TYPE=wayland");
 
-    let program = &args.command[0];
+    let program: &str;
+
+    if args.command.is_empty() {
+        if std::fs::exists("myde")? {
+            program = "myde"
+        } else if std::fs::exists("linux-unpacked/myde")? {
+            program = "linux-unpacked/myde"
+        } else {
+            eprintln!("错误: 请指定要渲染的程序");
+            eprintln!("用法: myde-wrap [--backend winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
+            std::process::exit(1);
+        }
+    } else {
+        program = &args.command[0]
+    }
+
     let program_args = if args.command.len() > 1 {
         &args.command[1..]
     } else {
