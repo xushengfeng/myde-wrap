@@ -148,7 +148,9 @@ impl RenderBackend for WinitBackend {
         Ok(())
     }
 
-    fn dispatch(&mut self) {}
+    fn dispatch(&mut self) -> bool {
+        false
+    }
 
     fn get_screens(&self) -> Vec<ScreenInfo> {
         let (width, height, refresh_rate) =
@@ -181,6 +183,7 @@ impl RenderBackend for WinitBackend {
         _state: &mut App,
         _configs: &[crate::renderer::ScreenConfig],
         _canvas_size: Option<(u32, u32)>,
+        _config_generation: u64,
     ) {
         // Winit backend handles rendering through its own event loop (WinitEvent::Redraw)
         // so this is a no-op here.

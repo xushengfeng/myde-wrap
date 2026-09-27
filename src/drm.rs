@@ -197,6 +197,9 @@ type GbmDrmCompositor = DrmCompositor<
 struct DrmOutputRuntime {
     compositor: GbmDrmCompositor,
     needs_vblank: bool,
+    /// 上屏元素的持久 ID。每帧新建 `Id::new()` 会让 DrmCompositor 的
+    /// damage 状态无法跨帧匹配，从而每帧都按全新元素全量重绘
+    element_id: smithay::backend::renderer::element::Id,
 }
 
 pub struct DrmBackend {
@@ -217,6 +220,10 @@ pub struct DrmBackend {
     /// 画布离屏纹理（随画布尺寸变化重建）
     pub offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture>,
     offscreen_size: Option<(u32, u32)>,
+    /// 上次上屏时的客户端内容代数（见 `App::content_generation`）
+    last_content_generation: u64,
+    /// 上次上屏时的屏幕配置代数
+    last_config_generation: u64,
 }
 
 // SAFETY: GlesRenderer contains raw pointers that are not Send, but it's safe to send
@@ -243,6 +250,8 @@ impl DrmBackend {
             rotate_shader: None,
             offscreen_texture: None,
             offscreen_size: None,
+            last_content_generation: 0,
+            last_config_generation: 0,
         }
     }
 }
@@ -276,9 +285,12 @@ impl RenderBackend for DrmBackend {
                     let tx = self.tx.as_ref().unwrap().clone();
                     _event_loop
                         .handle()
-                        .insert_source(drm_event, move |event, _meta, _state| {
+                        .insert_source(drm_event, move |event, _meta, state| {
                             if let smithay::backend::drm::DrmEvent::VBlank(handle) = event {
                                 let _ = tx.send(handle);
+                                // vblank 立刻处理：完成帧提交、发 frame 回调、渲染下一帧。
+                                // 不再等下个定时器 tick，避免 needs_vblank 卡掉整轮渲染
+                                state.on_vblank();
                             }
                         })
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -498,6 +510,7 @@ void main() {
             self.compositors.push(DrmOutputRuntime {
                 compositor,
                 needs_vblank: false,
+                element_id: smithay::backend::renderer::element::Id::new(),
             });
         }
 
@@ -520,18 +533,45 @@ void main() {
         Ok(())
     }
 
-    fn dispatch(&mut self) {
+    fn dispatch(&mut self) -> bool {
         // Handle DRM events sent via channel from the calloop source.
         // VBlank 按 crtc 路由到对应输出的 compositor 完成翻页。
+        // 返回本次是否有帧真正完成上屏（用于决定何时发 frame 回调）。
+        let mut presented = false;
         if let Some(rx) = self.rx.as_ref() {
             while let Ok(handle) = rx.try_recv() {
                 if let Some(index) = self.outputs.iter().position(|o| o.crtc == handle) {
                     if let Some(runtime) = self.compositors.get_mut(index) {
-                        runtime.needs_vblank = false;
-                        let _ = runtime.compositor.frame_submitted();
+                        if runtime.needs_vblank {
+                            runtime.needs_vblank = false;
+                            let _ = runtime.compositor.frame_submitted();
+                            presented = true;
+                        }
                     }
                 }
             }
+        }
+        presented
+    }
+
+    fn has_frame_in_flight(&self) -> bool {
+        self.compositors.iter().any(|r| r.needs_vblank)
+    }
+
+    /// 帧上屏（或确定无帧可等）后给客户端发 frame 回调。
+    /// 以前每 16ms 定时器无条件发、且 presentation time 恒为 0，客户端与真实呈现完全脱钩。
+    fn send_frame_callbacks(&self, state: &mut App) {
+        let Some(output_data) = self.outputs.first() else {
+            return;
+        };
+        let output = &output_data.smithay_output;
+        let time = self.start_time.elapsed();
+        // 节流间隔 = 刷新周期（mode.refresh 为毫赫兹）
+        let throttle = output
+            .current_mode()
+            .map(|mode| Duration::from_secs_f64(1000.0 / f64::from(mode.refresh).max(1.0)));
+        for window in state.space.elements() {
+            window.send_frame(output, time, throttle, |_, _| Some(output.clone()));
         }
     }
 
@@ -556,6 +596,7 @@ void main() {
         state: &mut App,
         configs: &[crate::renderer::ScreenConfig],
         canvas_size: Option<(u32, u32)>,
+        config_generation: u64,
     ) {
         self.frame_count += 1;
 
@@ -563,6 +604,33 @@ void main() {
         // offscreen_rect 为离屏画布矩形，app_rect 为应用内容范围（默认显示区域）
         let (offscreen_rect, app_rect) = canvas_rects(state, canvas_size);
         let canvas_valid = offscreen_rect.width > 0 && offscreen_rect.height > 0;
+        let canvas_now = (offscreen_rect.width, offscreen_rect.height);
+
+        // 相对上一次上屏：客户端内容、屏幕配置、画布尺寸是否变化
+        let offscreen_size_matches = !canvas_valid || self.offscreen_size == Some(canvas_now);
+        let content_changed =
+            state.content_generation != self.last_content_generation || !offscreen_size_matches;
+        let config_changed = config_generation != self.last_config_generation;
+        let offscreen_ready = !canvas_valid || self.offscreen_texture.is_some();
+
+        if self.renderer.is_none() || (!content_changed && !config_changed && offscreen_ready) {
+            // 画面没有变化：跳过离屏 pass、上屏与 page flip（静止画面零 GPU 开销），
+            // 只补发 frame 回调，客户端不会因为等不到回调而饿死
+            self.send_frame_callbacks(state);
+            return;
+        }
+
+        // 本次决定上屏，记录代数；此后只有新的 commit / 配置变更才会再渲
+        self.last_content_generation = state.content_generation;
+        self.last_config_generation = config_generation;
+        tracing::trace!(
+            "Frame {}: content_changed={} config_changed={} canvas={}x{}",
+            self.frame_count,
+            content_changed,
+            config_changed,
+            offscreen_rect.width,
+            offscreen_rect.height
+        );
 
         let renderer = match self.renderer.as_mut() {
             Some(r) => r,
@@ -595,6 +663,7 @@ void main() {
             .collect();
 
         // —— 第一遍：把画布内容 1:1 渲入离屏纹理（随画布尺寸变化重建）——
+        // 仅在客户端内容变化或纹理尺寸不匹配时重绘；只改屏幕配置时直接复用上一帧画布
         let mut offscreen_texture: Option<smithay::backend::renderer::gles::GlesTexture> = None;
         let mut crop_shader: Option<smithay::backend::renderer::gles::GlesTexProgram> = None;
 
@@ -619,11 +688,13 @@ void main() {
                 }
             }
 
+            let repaint_offscreen = content_changed || need_recreate;
+
             if let (Some(tex), Some(shader)) =
                 (self.offscreen_texture.as_mut(), self.rotate_shader.as_ref())
             {
-                use smithay::backend::renderer::{Bind, Frame, Renderer};
-                {
+                if repaint_offscreen {
+                    use smithay::backend::renderer::{Bind, Frame, Renderer};
                     let size = smithay::utils::Size::from((
                         offscreen_rect.width as i32,
                         offscreen_rect.height as i32,
@@ -689,7 +760,8 @@ void main() {
                 // 旋转截取 + 拉伸填充元素
                 final_elements.push(MyElement::Custom(
                     crate::custom_element::CropStretchElement {
-                        id: smithay::backend::renderer::element::Id::new(),
+                        // 每屏持久 ID：让 DrmCompositor 的 damage 状态能跨帧匹配
+                        id: runtime.element_id.clone(),
                         texture: tex.clone(),
                         src: smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
                             offscreen_rect.width as f64,
@@ -756,17 +828,10 @@ void main() {
             }
         }
 
-        // 无论是否出帧都给客户端发 frame 事件，避免阻塞
-        if let Some(output_data) = self.outputs.first() {
-            let output = &output_data.smithay_output;
-            state.space.elements().for_each(|window| {
-                window.send_frame(
-                    output,
-                    self.start_time.elapsed(),
-                    Some(Duration::ZERO),
-                    |_, _| Some(output.clone()),
-                )
-            });
+        // 有帧在飞 → 等 vblank 上屏后再发 frame 回调，客户端按真实呈现节奏提交；
+        // 没有帧在飞（本次没产生 damage）→ 立即补发，避免客户端等不到回调而饿死
+        if !self.compositors.iter().any(|r| r.needs_vblank) {
+            self.send_frame_callbacks(state);
         }
 
         state.space.refresh();

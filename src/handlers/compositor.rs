@@ -35,13 +35,18 @@ impl CompositorHandler for App {
                 root = parent;
             }
 
-            if let Some(window) = self
+            let window = self
                 .space
                 .elements()
                 .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-            {
+                .cloned();
+
+            if let Some(window) = window {
                 tracing::debug!("Commit for window surface: {:?}", surface);
                 window.on_commit();
+                // 窗口（含子 surface）内容可能已更新 → 标记重绘。
+                // 渲染由事件批次结束后的 refresh_and_render 触发
+                self.invalidate_content();
             } else {
                 tracing::debug!("Commit for unknown surface: {:?}", surface);
             }

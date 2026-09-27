@@ -206,8 +206,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loop_handle = event_loop.handle();
     let socket_server = Arc::new(socket_server);
     let renderer = Arc::new(Mutex::new(MyRenderer::new(backend.get_screens())));
-    let compositor = Arc::new(Compositor::new(renderer.clone()));
-    let backend = Arc::new(Mutex::new(backend));
+    // 有脏内容需要上屏：socket 线程与事件循环线程共享
+    let redraw = state.redraw.clone();
+    let compositor = Arc::new(Compositor::new(renderer.clone(), redraw.clone()));
+    let output_count = backend.get_output_count();
+    // 渲染后端交给事件循环线程独占（vblank/commit 事件驱动渲染需要直接访问它）
+    state.set_backend(backend, renderer.clone());
 
     // 克隆socket_server以在事件循环中使用
     let socket_server_clone = socket_server.clone();
@@ -247,45 +251,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // For DRM backend, add a timer to periodically render the space
-    let backend_for_render = backend.clone();
+    // 兜底定时器：socket 配置变更、窗口关闭等没有 Wayland 事件触发的场景。
+    // 常规渲染由客户端 commit 与 DRM vblank 驱动，这里只负责"没有事件也别卡住"，
+    // 画面静止时回调只做一次原子读取，几乎零开销。
     if is_drm {
-        // Create a timer that fires immediately and then every 16ms (~60fps)
         let timer = Timer::immediate();
-        let renderer_for_timer = renderer.clone();
         loop_handle.insert_source(timer, move |_event, _, state| {
-            let mut backend_guard = backend_for_render.blocking_lock();
-            backend_guard.dispatch();
-            let (configs, canvas_size) = {
-                let renderer_guard = renderer_for_timer.blocking_lock();
-                (
-                    renderer_guard.get_screen_configs().to_vec(),
-                    renderer_guard.get_canvas_size(),
-                )
-            };
-            backend_guard.render_space(state, &configs, canvas_size);
-            TimeoutAction::ToDuration(Duration::from_millis(16)) // ~60fps
+            state.refresh_and_render();
+            TimeoutAction::ToDuration(Duration::from_millis(16))
         })?;
     }
 
     // 设置默认全屏显示
     // 如果没有自定义配置，默认全屏显示应用到所有屏幕
     let renderer_clone = renderer.clone();
-    let backend_for_default = backend.clone();
+    let redraw_for_default = redraw.clone();
 
     // 在单独的线程中设置默认全屏显示
     std::thread::spawn(move || {
         // 等待一小段时间让应用启动
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // 获取渲染器配置
-
-        let backend_guard = backend_for_default.blocking_lock();
-        let backend_output_count = backend_guard.get_output_count();
-
         // 为每个屏幕设置默认全屏配置
         let mut renderer_guard = renderer_clone.blocking_lock();
-        for screen_index in 0..backend_output_count {
+        for screen_index in 0..output_count {
             let config = renderer_guard.get_default_fullscreen_config(screen_index);
             info!(
                 "setting default fullscreen config: screen {}, rect {:?}, transform {:?} (rect 缺省 = 应用内容范围拉伸铺满)",
@@ -298,6 +287,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.transform.clone(),
             );
         }
+        drop(renderer_guard);
+        // 通知渲染线程配置已就绪
+        redraw_for_default.store(true, std::sync::atomic::Ordering::Release);
     });
 
     // Run the event loop

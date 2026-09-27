@@ -13,20 +13,42 @@ pub trait RenderBackend: Send {
         event_loop: &mut EventLoop<App>,
         state: &mut App,
     ) -> Result<(), Box<dyn std::error::Error>>;
-    fn dispatch(&mut self);
+
+    /// 处理后端事件（DRM：消费 vblank 并完成帧提交、归还 swapchain 槽位）。
+    ///
+    /// 返回本次是否有帧完成上屏——渲染线程据此在正确的时机给客户端发 frame 回调。
+    fn dispatch(&mut self) -> bool {
+        false
+    }
+
     fn get_output_count(&self) -> usize;
 
+    /// 是否还有帧在等 vblank（帧在飞）。
+    ///
+    /// 有帧在飞时不应再渲染：既浪费，又会把 vblank 门控打乱造成掉帧。
+    fn has_frame_in_flight(&self) -> bool {
+        false
+    }
+
+    /// 帧真正扫描上屏之后给客户端发 frame 回调，让客户端按实际呈现节奏提交。
+    ///
+    /// 没有帧在飞时（画面无变化）也由渲染循环调用，避免客户端等不到回调而饿死。
+    fn send_frame_callbacks(&self, _state: &mut App) {}
+
     /// Render the Wayland space contents to the screen.
-    /// This is called periodically to update the display with Wayland surfaces.
     ///
     /// `canvas_size` 为 SetWindowSize 声明的虚拟画布尺寸（可为 None）。
     /// 实际画布 = max(声明尺寸, 应用窗口尺寸)；配置中 rects 留空（或无配置）时，
     /// 默认把整个画布拉伸铺满目标屏幕。
+    ///
+    /// `config_generation` 为屏幕配置代数（见 [`crate::renderer::Renderer::config_generation`]），
+    /// 用于区分"内容变了"与"仅配置变了"，从而跳过无谓的离屏重绘。
     fn render_space(
         &mut self,
         _state: &mut App,
         _configs: &[ScreenConfig],
         _canvas_size: Option<(u32, u32)>,
+        _config_generation: u64,
     ) {
         // Default implementation does nothing
     }

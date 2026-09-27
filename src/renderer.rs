@@ -9,6 +9,9 @@ pub struct Renderer {
     screens: Vec<ScreenInfo>,
     input_enabled: bool,
     screen_configs: Vec<ScreenConfig>,
+    /// 屏幕配置代数：任何影响上屏结果的配置变更都会递增。
+    /// 渲染线程据此判断"仅配置变了"（只需重做上屏那一遍，离屏画布可复用）
+    config_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -35,7 +38,13 @@ impl Renderer {
             screens,
             input_enabled: true,
             screen_configs: Vec::new(),
+            config_generation: 0,
         }
+    }
+
+    /// 屏幕配置代数（渲染线程读取，用于判断配置是否变化）
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation
     }
 
     /// SetWindowSize：声明虚拟画布尺寸（不强制修改应用窗口大小，
@@ -43,6 +52,7 @@ impl Renderer {
     /// 保证虚拟画布不裁切应用。
     pub fn set_window_size(&mut self, width: u32, height: u32) {
         self.canvas_size = Some((width, height));
+        self.config_generation = self.config_generation.wrapping_add(1);
     }
 
     /// 获取 SetWindowSize 声明的虚拟画布尺寸（None 表示未声明，自动跟随应用窗口）
@@ -52,11 +62,13 @@ impl Renderer {
 
     pub fn capture_rects(&mut self, rects: Vec<Rect>) -> Vec<Rect> {
         self.captured_rects = rects.clone();
+        self.config_generation = self.config_generation.wrapping_add(1);
         rects
     }
 
     pub fn transform_rects(&mut self, transforms: Vec<Transform>) {
         self.transforms = transforms;
+        self.config_generation = self.config_generation.wrapping_add(1);
     }
 
     /// 将画布截取区域渲染到屏幕（一个屏幕一个截取区域）
@@ -92,6 +104,7 @@ impl Renderer {
 
         self.captured_rects = rect.into_iter().collect();
         self.transforms = transform.into_iter().collect();
+        self.config_generation = self.config_generation.wrapping_add(1);
         Ok(())
     }
 
