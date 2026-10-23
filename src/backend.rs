@@ -1,6 +1,7 @@
 use crate::protocol::ScreenInfo;
 use crate::renderer::ScreenConfig;
 use crate::wayland::App;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::reexports::calloop::EventLoop;
 
 pub trait RenderBackend: Send {
@@ -26,6 +27,12 @@ pub trait RenderBackend: Send {
     }
 
     fn get_output_count(&self) -> usize;
+
+    /// 把客户端 dmabuf 导入渲染器。默认返回 true，表示接受该 buffer：
+    /// winit 后端的渲染器在事件循环闭包里，无法在这里访问，渲染时会惰性导入。
+    fn import_dmabuf(&mut self, _dmabuf: &Dmabuf) -> bool {
+        true
+    }
 
     /// 是否还有帧在等 vblank（帧在飞）。
     ///

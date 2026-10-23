@@ -238,6 +238,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // 让myde以桌面运行
     envs.push(("runAsDesktop".to_string(), "true".to_string()));
+    // 已注册 dmabuf global 时告知子进程：桌面可以走 GPU shared texture，
+    // 否则 myde 会退回 CPU 拷贝（兼容旧版 wrap）
+    if state.dmabuf_global.is_some() {
+        envs.push(("MYDE_WRAP_DMABUF".to_string(), "1".to_string()));
+    }
 
     let child_stdio = || {
         if args.child_output == "null" {

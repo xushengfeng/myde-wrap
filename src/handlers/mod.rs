@@ -2,6 +2,8 @@ mod compositor;
 mod xdg_shell;
 
 use crate::wayland::App;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 
 //
 // Wl Seat
@@ -63,8 +65,28 @@ impl DataDeviceHandler for App {
 
 impl OutputHandler for App {}
 
+impl DmabufHandler for App {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        let ok = self
+            .backend
+            .as_mut()
+            .map(|backend| backend.import_dmabuf(&dmabuf))
+            .unwrap_or(true);
+        if ok {
+            let _ = notifier.successful::<App>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+
 // Delegate macros
 smithay::delegate_compositor!(App);
+smithay::delegate_dmabuf!(App);
 smithay::delegate_shm!(App);
 smithay::delegate_seat!(App);
 smithay::delegate_xdg_shell!(App);

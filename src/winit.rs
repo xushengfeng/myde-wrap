@@ -4,7 +4,7 @@ use smithay::{
     backend::{
         renderer::{
             damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement,
-            gles::GlesRenderer,
+            gles::GlesRenderer, ImportDma,
         },
         winit::{self, WinitEvent},
     },
@@ -43,7 +43,13 @@ impl RenderBackend for WinitBackend {
         event_loop: &mut EventLoop<App>,
         state: &mut App,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut backend, winit) = winit::init()?;
+        let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+
+        // 从 winit 渲染器拿真实支持的 dmabuf 格式，注册 v3 全局。
+        // 这里不导入 buffer（渲染器在事件循环闭包里），渲染时惰性导入。
+        let dmabuf_formats: Vec<smithay::backend::allocator::Format> =
+            backend.renderer().dmabuf_formats().iter().copied().collect();
+        state.setup_dmabuf(dmabuf_formats);
 
         let mode = Mode {
             size: backend.window_size(),

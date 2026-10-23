@@ -14,6 +14,7 @@ use smithay::{
         renderer::{
             element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
             gles::GlesRenderer,
+            ImportDma,
         },
     },
     output::{Output, OutputModeSource, PhysicalProperties, Subpixel},
@@ -488,6 +489,23 @@ impl RenderBackend for DrmBackend {
         let egl_context = EGLContext::new(&egl_display)?;
         let mut renderer = unsafe { GlesRenderer::new(egl_context)? };
 
+        // dmabuf：把渲染器支持的格式注册给客户端。带 feedback（v4），
+        // 主设备号使用当前 DRM 设备，客户端才能按正确格式分配。
+        let dmabuf_formats: Vec<smithay::backend::allocator::Format> =
+            renderer.dmabuf_formats().iter().copied().collect();
+        match smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+            device.device_id(),
+            dmabuf_formats.iter().copied(),
+        )
+        .build()
+        {
+            Ok(feedback) => state.setup_dmabuf_feedback(&feedback),
+            Err(err) => {
+                tracing::warn!("构建 dmabuf feedback 失败: {err}，回退到 v3");
+                state.setup_dmabuf(dmabuf_formats);
+            }
+        }
+
         let shader = renderer.compile_custom_texture_shader(
             r#"
 #version 100
@@ -635,6 +653,13 @@ void main() {
         );
 
         Ok(())
+    }
+
+    fn import_dmabuf(&mut self, dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf) -> bool {
+        match self.renderer.as_mut() {
+            Some(renderer) => renderer.import_dmabuf(dmabuf, None).is_ok(),
+            None => false,
+        }
     }
 
     fn shutdown(&mut self) {

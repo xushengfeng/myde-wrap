@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::backend::RenderBackend;
 use smithay::{
+    backend::allocator::Format,
     desktop::{PopupManager, Space, Window},
     input::{Seat, SeatState},
     reexports::{
@@ -18,6 +19,7 @@ use smithay::{
     },
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
@@ -37,6 +39,9 @@ pub struct App {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
+    /// dmabuf 全局必须保活，否则客户端创建的 buffer 会失效
+    pub dmabuf_global: Option<DmabufGlobal>,
     // 协议状态句柄：即使当前无读取点也需随 App 保活（xdg-output 全局、seat 句柄）
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
@@ -76,6 +81,7 @@ impl App {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let dmabuf_state = DmabufState::new();
         let popups = PopupManager::default();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
 
@@ -116,6 +122,8 @@ impl App {
             compositor_state,
             xdg_shell_state,
             shm_state,
+            dmabuf_state,
+            dmabuf_global: None,
             output_manager_state,
             seat_state,
             data_device_state,
@@ -128,6 +136,30 @@ impl App {
             last_window_count: 0,
             in_flight_since: None,
         }
+    }
+
+    /// 注册 dmabuf v3 全局（无 feedback）。适合拿不到主设备号的 winit 后端。
+    pub fn setup_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
+        let formats: Vec<Format> = formats.into_iter().collect();
+        if formats.is_empty() {
+            tracing::warn!("渲染器未报告 dmabuf 格式，跳过 dmabuf global");
+            return;
+        }
+        let count = formats.len();
+        self.dmabuf_global = Some(
+            self.dmabuf_state
+                .create_global::<App>(&self.display_handle, formats),
+        );
+        tracing::info!("已注册 dmabuf global（v3），{} 个格式", count);
+    }
+
+    /// 注册带 feedback 的 dmabuf v4 全局；需要渲染器所在 DRM 设备的主设备号。
+    pub fn setup_dmabuf_feedback(&mut self, feedback: &DmabufFeedback) {
+        self.dmabuf_global = Some(
+            self.dmabuf_state
+                .create_global_with_default_feedback::<App>(&self.display_handle, feedback),
+        );
+        tracing::info!("已注册 dmabuf global（v4 feedback）");
     }
 
     fn init_wayland_listener(
