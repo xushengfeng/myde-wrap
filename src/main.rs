@@ -17,6 +17,7 @@ use smithay::reexports::{
     },
     wayland_server::Display,
 };
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +53,49 @@ struct Args {
     /// 子进程 stdout/stderr 处理方式 (inherit|null)，默认 inherit
     #[arg(long, value_name = "MODE", default_value = "inherit")]
     child_output: String,
+}
+
+/// 查找相对程序名时可用的目录：当前目录（从解包目录运行 `myde-wrap`），
+/// 然后是本程序所在目录（安装包里 `myde-wrap` 与 `myde` 同级）。
+fn program_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs
+}
+
+/// 把程序参数解析成可执行路径。
+///
+/// 裸名字（不含 `/`）不能直接交给 `Command::new`：它只查 PATH，当前目录里的
+/// `myde` 会以 NotFound 失败。这里先按 [`program_search_dirs`] 查找普通文件，
+/// 命中则用绝对路径；都没命中再原样返回，交给 PATH 查找。
+fn resolve_program(program: &str) -> PathBuf {
+    if Path::new(program).is_absolute() || program.contains('/') {
+        return PathBuf::from(program);
+    }
+    for dir in program_search_dirs() {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(program)
+}
+
+/// 未指定程序时自动寻找内置的 `myde`（解包目录或其上一级目录）。
+fn detect_program() -> Option<PathBuf> {
+    ["myde", "linux-unpacked/myde"].iter().find_map(|name| {
+        program_search_dirs()
+            .into_iter()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,21 +173,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("WAYLAND_DISPLAY={:?}", state.socket_name);
     info!("XDG_SESSION_TYPE=wayland");
 
-    let program: &str;
-
-    if args.command.is_empty() {
-        if std::fs::exists("myde")? {
-            program = "myde"
-        } else if std::fs::exists("linux-unpacked/myde")? {
-            program = "linux-unpacked/myde"
-        } else {
-            eprintln!("错误: 请指定要渲染的程序");
-            eprintln!("用法: myde-wrap [--backend auto|winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
-            std::process::exit(1);
-        }
+    let program: PathBuf = if let Some(name) = args.command.first() {
+        resolve_program(name)
+    } else if let Some(found) = detect_program() {
+        found
     } else {
-        program = &args.command[0]
-    }
+        eprintln!("错误: 请指定要渲染的程序");
+        eprintln!("用法: myde-wrap [--backend auto|winit|drm] [--log-level LEVEL] [--child-output inherit|null] <command> [args...]");
+        std::process::exit(1);
+    };
 
     let program_args = if args.command.len() > 1 {
         &args.command[1..]
@@ -151,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[]
     };
 
-    info!("run program: {} {:?}", program, program_args);
+    info!("run program: {} {:?}", program.display(), program_args);
 
     // 继承所有父进程环境变量
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
@@ -184,22 +222,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut child = Command::new(program)
+    let mut child = Command::new(&program)
         .args(program_args)
         .envs(envs)
         .stdout(child_stdio())
         .stderr(child_stdio())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "无法启动程序 {}: {}\n提示: 裸命令名会先查找当前目录和 myde-wrap 所在目录，再查找 PATH；也可传入 ./myde 这样的路径",
+                program.display(),
+                e
+            )
+        })?;
 
     info!("program started, PID: {}", child.id());
 
-    // Spawn a task to handle child process exit
+    // 子进程退出即结束合成器（单应用 kiosk），否则应用崩溃后 myde-wrap
+    // 会一直停在黑屏上；退出码在事件循环结束后向外传递
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let loop_signal = event_loop.get_signal();
+    let child_exit = Arc::new(std::sync::Mutex::new(None));
+    let child_done = Arc::new(AtomicBool::new(false));
+    let child_exit_for_thread = child_exit.clone();
+    let child_done_for_thread = child_done.clone();
     std::thread::spawn(move || {
-        let status = child.wait();
-        match status {
-            Ok(status) => info!("program exited, status: {}", status),
+        match child.wait() {
+            Ok(status) => {
+                info!("program exited, status: {}", status);
+                *child_exit_for_thread.lock().unwrap() = Some(status);
+            }
             Err(e) => error!("failed to wait for program: {}", e),
         }
+        child_done_for_thread.store(true, Ordering::Release);
+        // 唤醒可能正阻塞在 poll 上的事件循环
+        loop_signal.wakeup();
     });
 
     // 将Socket服务器添加到事件循环中
@@ -294,10 +351,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the event loop
     info!("Starting event loop...");
-    event_loop.run(None, &mut state, move |_| {
-        // Wayland events are handled by the display source in init_wayland_listener
-        // DRM rendering is handled by the timer above
-    })?;
+    // 用 dispatch 循环而非 EventLoop::run：run() 进入时会清空 stop 标志，
+    // 若子进程在进入循环前就退出，停止信号会丢失
+    while !child_done.load(Ordering::Acquire) {
+        event_loop.dispatch(None, &mut state)?;
+    }
+
+    // 应用异常退出时以非零退出码结束，方便调用方发现问题
+    if let Some(status) = *child_exit.lock().unwrap() {
+        if !status.success() {
+            return Err(format!("程序退出: {}", status).into());
+        }
+    }
 
     Ok(())
 }

@@ -43,6 +43,9 @@ cargo build --release
 cargo run -- /usr/bin/weston-terminal
 ```
 
+未指定程序时，会在当前目录和 `myde-wrap` 所在目录查找 `myde`。裸命令名（不含 `/`）同样
+先在这两个目录查找，找不到再按 PATH 查找；因此解包目录里直接 `./myde-wrap myde` 即可。
+
 ### 命令行参数
 
 ```
