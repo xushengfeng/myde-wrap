@@ -88,6 +88,42 @@ fn resolve_program(program: &str) -> PathBuf {
     PathBuf::from(program)
 }
 
+/// 启动前检查输入设备权限：桌面（myde）自己读 evdev，若当前用户读不到
+/// `/dev/input/event*`，桌面收不到键盘和鼠标事件（display 正常但输入全无）。
+fn check_input_device_access() {
+    let dir = Path::new("/dev/input");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        warn!("未找到 /dev/input，键盘鼠标不可用");
+        return;
+    };
+    let mut any_event_node = false;
+    let mut readable = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_event = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("event"));
+        if !is_event {
+            continue;
+        }
+        any_event_node = true;
+        if std::fs::File::open(&path).is_ok() {
+            readable = true;
+            break;
+        }
+    }
+    if !any_event_node {
+        warn!("未找到 /dev/input/event*，键盘鼠标不可用");
+        return;
+    }
+    if !readable {
+        warn!("无法读取 /dev/input/event*（权限不足）：桌面将收不到键盘和鼠标事件");
+        warn!(
+            "解决方法：把当前用户加入 input 组（sudo usermod -aG input $USER，重新登录），或给输入设备添加 uaccess udev 规则"
+        );
+    }
+}
+
 /// 未指定程序时自动寻找内置的 `myde`（解包目录或其上一级目录）。
 fn detect_program() -> Option<PathBuf> {
     ["myde", "linux-unpacked/myde"].iter().find_map(|name| {
@@ -190,6 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("run program: {} {:?}", program.display(), program_args);
+    check_input_device_access();
 
     // 继承所有父进程环境变量
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
