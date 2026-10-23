@@ -221,6 +221,13 @@ impl App {
         self.request_redraw();
     }
 
+    /// 退出前让后端恢复显示（DRM：恢复启动前的 fbcon 状态）
+    pub fn shutdown_backend(&mut self) {
+        if let Some(mut backend) = self.backend.take() {
+            backend.shutdown();
+        }
+    }
+
     /// 标记有内容需要上屏（可跨线程调用）
     pub fn request_redraw(&self) {
         self.redraw.store(true, Ordering::Release);

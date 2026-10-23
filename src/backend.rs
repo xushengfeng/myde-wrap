@@ -14,6 +14,10 @@ pub trait RenderBackend: Send {
         state: &mut App,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
+    /// 退出前清理后端资源。DRM 后端的顺序很关键：
+    /// 先释放 surface（其 Drop 会关掉我们设置的 CRTC），再把启动前的显示状态恢复回来。
+    fn shutdown(&mut self) {}
+
     /// 处理后端事件（DRM：消费 vblank 并完成帧提交、归还 swapchain 槽位）。
     ///
     /// 返回本次是否有帧完成上屏——渲染线程据此在正确的时机给客户端发 frame 回调。

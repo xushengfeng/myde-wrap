@@ -10,6 +10,10 @@ mod wayland;
 mod winit;
 
 use clap::Parser;
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use smithay::reexports::{
     calloop::{
         timer::{TimeoutAction, Timer},
@@ -19,8 +23,9 @@ use smithay::reexports::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -88,42 +93,6 @@ fn resolve_program(program: &str) -> PathBuf {
     PathBuf::from(program)
 }
 
-/// 启动前检查输入设备权限：桌面（myde）自己读 evdev，若当前用户读不到
-/// `/dev/input/event*`，桌面收不到键盘和鼠标事件（display 正常但输入全无）。
-fn check_input_device_access() {
-    let dir = Path::new("/dev/input");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        warn!("未找到 /dev/input，键盘鼠标不可用");
-        return;
-    };
-    let mut any_event_node = false;
-    let mut readable = false;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_event = path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("event"));
-        if !is_event {
-            continue;
-        }
-        any_event_node = true;
-        if std::fs::File::open(&path).is_ok() {
-            readable = true;
-            break;
-        }
-    }
-    if !any_event_node {
-        warn!("未找到 /dev/input/event*，键盘鼠标不可用");
-        return;
-    }
-    if !readable {
-        warn!("无法读取 /dev/input/event*（权限不足）：桌面将收不到键盘和鼠标事件");
-        warn!(
-            "解决方法：把当前用户加入 input 组（sudo usermod -aG input $USER，重新登录），或给输入设备添加 uaccess udev 规则"
-        );
-    }
-}
-
 /// 未指定程序时自动寻找内置的 `myde`（解包目录或其上一级目录）。
 fn detect_program() -> Option<PathBuf> {
     ["myde", "linux-unpacked/myde"].iter().find_map(|name| {
@@ -165,6 +134,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_server = SocketServer::new(socket_path.clone())?;
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
+
+    // Ctrl+C / kill / 终端关闭时走正常退出流程（释放 Drop、恢复显示），
+    // 而不是被信号直接终止把 DRM 留在最后一帧（黑屏）
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+        let shutdown = shutdown.clone();
+        let loop_signal = event_loop.get_signal();
+        std::thread::spawn(move || {
+            // 保持 handlers 安装（Signals 被 drop 后会恢复默认行为，第二次
+            // Ctrl+C 就会直接杀进程、跳过恢复）；只处理第一次
+            for signal in signals.forever() {
+                if !shutdown.swap(true, Ordering::AcqRel) {
+                    info!("收到信号 {}，准备退出", signal);
+                    loop_signal.wakeup();
+                }
+            }
+        });
+    }
+
     let display: Display<App> = Display::new()?;
     let mut state = App::new(&mut event_loop, display);
 
@@ -226,7 +215,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("run program: {} {:?}", program.display(), program_args);
-    check_input_device_access();
 
     // 继承所有父进程环境变量
     let mut envs: Vec<(String, String)> = std::env::vars().collect();
@@ -259,25 +247,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut child = Command::new(&program)
+    let mut child = match Command::new(&program)
         .args(program_args)
         .envs(envs)
         .stdout(child_stdio())
         .stderr(child_stdio())
         .spawn()
-        .map_err(|e| {
-            format!(
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // 后端已经初始化（可能已 modeset），失败退出前同样要恢复显示
+            let mut backend = backend;
+            backend.shutdown();
+            return Err(format!(
                 "无法启动程序 {}: {}\n提示: 裸命令名会先查找当前目录和 myde-wrap 所在目录，再查找 PATH；也可传入 ./myde 这样的路径",
                 program.display(),
                 e
             )
-        })?;
-
-    info!("program started, PID: {}", child.id());
+            .into());
+        }
+    };
+    let child_pid = child.id();
+    info!("program started, PID: {}", child_pid);
 
     // 子进程退出即结束合成器（单应用 kiosk），否则应用崩溃后 myde-wrap
     // 会一直停在黑屏上；退出码在事件循环结束后向外传递
-    use std::sync::atomic::{AtomicBool, Ordering};
     let loop_signal = event_loop.get_signal();
     let child_exit = Arc::new(std::sync::Mutex::new(None));
     let child_done = Arc::new(AtomicBool::new(false));
@@ -390,14 +384,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting event loop...");
     // 用 dispatch 循环而非 EventLoop::run：run() 进入时会清空 stop 标志，
     // 若子进程在进入循环前就退出，停止信号会丢失
-    while !child_done.load(Ordering::Acquire) {
-        event_loop.dispatch(None, &mut state)?;
+    let mut loop_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+    while !child_done.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire) {
+        if let Err(e) = event_loop.dispatch(None, &mut state) {
+            loop_result = Err(Box::new(e));
+            break;
+        }
     }
 
+    let signaled = shutdown.load(Ordering::Acquire);
+    if signaled {
+        info!("正在退出并恢复显示…");
+    }
+
+    // 结束子进程：Ctrl+C 时它一般也收到了 SIGINT，但 SIGTERM/终端关闭时不一定
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !child_done.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !child_done.load(Ordering::Acquire) {
+        // 等不到就强杀，避免退出后还留着一个看不见的桌面进程
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    // 恢复显示放在子进程之后，避免它最后几帧又盖回去
+    state.shutdown_backend();
+    if signaled {
+        // 信号退出（Ctrl+C）是主动行为，不当作应用异常报错
+        eprintln!("myde-wrap: 已退出");
+    }
+    loop_result?;
+
     // 应用异常退出时以非零退出码结束，方便调用方发现问题
-    if let Some(status) = *child_exit.lock().unwrap() {
-        if !status.success() {
-            return Err(format!("程序退出: {}", status).into());
+    if !signaled {
+        if let Some(status) = *child_exit.lock().unwrap() {
+            if !status.success() {
+                return Err(format!("程序退出: {}", status).into());
+            }
         }
     }
 

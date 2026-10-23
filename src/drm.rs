@@ -17,14 +17,14 @@ use smithay::{
         },
     },
     output::{Output, OutputModeSource, PhysicalProperties, Subpixel},
-    reexports::drm::control::{connector, crtc},
+    reexports::drm::control::{connector, crtc, framebuffer, Device as DrmControlDevice},
     utils::Transform as SmithayTransform,
 };
 use std::fs::OpenOptions;
 use std::os::unix::io::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::backend::RenderBackend;
 use crate::protocol::{Rect, ScreenInfo};
@@ -93,6 +93,61 @@ struct DrmOutputData {
     width: u32,
     height: u32,
     smithay_output: Output,
+}
+
+/// 启动前的 CRTC 状态（文本控制台/fbcon）。退出时用 `set_crtc` 原样恢复：
+/// smithay 的 `DrmDevice::drop` 是按属性快照恢复的，而 `DrmDevice::new` 里的
+/// reset 已经释放了原来的 MODE_ID blob，在部分驱动（如 xe）上会 EINVAL。
+#[derive(Debug, Clone)]
+struct SavedCrtc {
+    crtc: crtc::Handle,
+    connectors: Vec<connector::Handle>,
+    mode: smithay::reexports::drm::control::Mode,
+    fb: framebuffer::Handle,
+    position: (u32, u32),
+}
+
+/// 在 `DrmDevice::new` 之前记录当前显示状态。VT 里的 fbcon 会以
+/// CRTC + fb + mode 的形式出现在这里。
+fn capture_crtc_state(fd: &DrmDeviceFd) -> Vec<SavedCrtc> {
+    let Ok(res) = fd.resource_handles() else {
+        return Vec::new();
+    };
+    let mut saved = Vec::new();
+    for &crtc_handle in res.crtcs() {
+        let Ok(info) = fd.get_crtc(crtc_handle) else {
+            continue;
+        };
+        let (Some(fb), Some(mode)) = (info.framebuffer(), info.mode()) else {
+            continue;
+        };
+        let mut connectors = Vec::new();
+        for &conn in res.connectors() {
+            let Ok(conn_info) = fd.get_connector(conn, false) else {
+                continue;
+            };
+            let Some(enc) = conn_info.current_encoder() else {
+                continue;
+            };
+            let Ok(enc_info) = fd.get_encoder(enc) else {
+                continue;
+            };
+            if enc_info.crtc() == Some(crtc_handle) {
+                connectors.push(conn);
+            }
+        }
+        if connectors.is_empty() {
+            continue;
+        }
+        saved.push(SavedCrtc {
+            crtc: crtc_handle,
+            connectors,
+            mode,
+            fb,
+            position: info.position(),
+        });
+    }
+    saved
 }
 
 // Wayland 变体比 Custom 大 ~300B；渲染循环每帧构造元素，装箱会引入额外堆分配，
@@ -206,8 +261,6 @@ pub struct DrmBackend {
     width: u32,
     height: u32,
     outputs: Vec<DrmOutputData>,
-    device: Option<DrmDevice>,
-    device_fd: Option<DrmDeviceFd>,
     gbm: Option<GbmDevice<Arc<OwnedFd>>>,
     renderer: Option<GlesRenderer>,
     compositors: Vec<DrmOutputRuntime>,
@@ -224,6 +277,13 @@ pub struct DrmBackend {
     last_content_generation: u64,
     /// 上次上屏时的屏幕配置代数
     last_config_generation: u64,
+    /// 启动前的显示状态（fbcon），退出时恢复
+    saved_crtcs: Vec<SavedCrtc>,
+    // device/device_fd 放在最后：字段按声明顺序 drop，必须等 compositor（surface）
+    // 先 clear_state 关掉我们设置的 CRTC，再由 device 恢复启动前状态；
+    // 反过来会被 surface 的 Drop 再次关掉，退出后就是黑屏
+    device_fd: Option<DrmDeviceFd>,
+    device: Option<DrmDevice>,
 }
 
 // SAFETY: GlesRenderer contains raw pointers that are not Send, but it's safe to send
@@ -252,7 +312,41 @@ impl DrmBackend {
             offscreen_size: None,
             last_content_generation: 0,
             last_config_generation: 0,
+            saved_crtcs: Vec::new(),
         }
+    }
+
+    /// 用启动前记录的 (crtc, fb, mode, connectors) 把显示恢复成 fbcon。
+    /// 必须还在 DRM master 状态下调用。
+    fn restore_saved_state(&self) -> bool {
+        let Some(fd) = self.device_fd.as_ref() else {
+            return false;
+        };
+        if self.saved_crtcs.is_empty() {
+            return false;
+        }
+        let mut all_ok = true;
+        for saved in &self.saved_crtcs {
+            match fd.set_crtc(
+                saved.crtc,
+                Some(saved.fb),
+                saved.position,
+                &saved.connectors,
+                Some(saved.mode),
+            ) {
+                Ok(()) => info!(
+                    "显示已恢复到启动前状态：crtc {:?} fb {:?} mode {}",
+                    saved.crtc,
+                    saved.fb,
+                    saved.mode.name().to_string_lossy()
+                ),
+                Err(e) => {
+                    all_ok = false;
+                    error!("恢复 crtc {:?} 的显示状态失败: {}", saved.crtc, e);
+                }
+            }
+        }
+        all_ok
     }
 }
 
@@ -271,6 +365,7 @@ impl RenderBackend for DrmBackend {
         let drm_paths = ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/renderD128"];
         let mut device: Option<DrmDevice> = None;
         let mut device_fd: Option<DrmDeviceFd> = None;
+        let mut initial_crtcs: Vec<SavedCrtc> = Vec::new();
 
         for path in &drm_paths {
             match OpenOptions::new().read(true).write(true).open(path) {
@@ -279,6 +374,10 @@ impl RenderBackend for DrmBackend {
 
                     let fd: OwnedFd = file.as_fd().try_clone_to_owned()?;
                     let fd = DrmDeviceFd::new(fd.into());
+
+                    // 必须在 DrmDevice::new（会 reset_state）之前记录控制台/前一个
+                    // 显示状态的 CRTC，否则退出时无法把 fbcon 恢复回来
+                    let saved_crtcs = capture_crtc_state(&fd);
 
                     let (dev, drm_event) = DrmDevice::new(fd.clone(), true)?;
 
@@ -295,7 +394,6 @@ impl RenderBackend for DrmBackend {
                         })
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-                    use smithay::reexports::drm::control::Device;
                     let res = dev.resource_handles()?;
 
                     // Find all available connectors
@@ -356,6 +454,7 @@ impl RenderBackend for DrmBackend {
                     if !self.outputs.is_empty() {
                         device = Some(dev);
                         device_fd = Some(fd);
+                        initial_crtcs = saved_crtcs;
                         break;
                     }
                 }
@@ -524,6 +623,11 @@ void main() {
         self.gbm = Some(gbm);
         self.renderer = Some(renderer);
         self.rotate_shader = Some(shader);
+        self.saved_crtcs = initial_crtcs;
+        info!(
+            "已记录启动前显示状态（{} 个 CRTC），退出时用于恢复文本控制台",
+            self.saved_crtcs.len()
+        );
 
         info!(
             "DRM backend initialized, found {} outputs",
@@ -531,6 +635,29 @@ void main() {
         );
 
         Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        info!("退出：正在恢复启动前的显示状态");
+        // 顺序很重要：先丢 compositor/surface，其 Drop 会 clear_state 关掉我们
+        // 设置的 CRTC；再恢复 fbcon。反过来的话恢复会被随后的 clear_state 覆盖
+        self.compositors.clear();
+        self.offscreen_texture = None;
+        self.rotate_shader = None;
+
+        let restored = self.restore_saved_state();
+        if restored {
+            if let Some(device) = self.device.as_mut() {
+                // 释放 DRM master，并让 smithay 的 Drop 跳过它那套属性快照恢复
+                //（reset_state 已销毁原 MODE_ID blob，部分驱动会 EINVAL）
+                device.pause();
+            }
+        } else {
+            warn!("未能恢复启动前的显示状态，交给 smithay 释放时再试一次");
+        }
+
+        self.renderer = None;
+        self.gbm = None;
     }
 
     fn dispatch(&mut self) -> bool {
