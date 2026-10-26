@@ -36,6 +36,8 @@
 cargo build --release
 ```
 
+在 x86_64 和 aarch64 Linux 上都可以直接本机编译，产物分别用于对应架构。
+
 ### 运行
 
 ```bash
